@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <title>Inspecciones</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="description" content="Registro de hallazgos de inspección por voz. Todo se procesa y guarda en el teléfono.">
+  <meta name="theme-color" content="#F2F2F7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Inspecciones">
+  <link rel="manifest" href="./manifest.webmanifest">
+  <link rel="apple-touch-icon" href="./icons/icon-180.png">
+  <link rel="icon" href="./icons/icon-192.png">
+  <link rel="stylesheet" href="./app.css">
+  <script src="./lib/jspdf.umd.min.js"></script>
+  <script src="./lib/jszip.min.js"></script>
+</head>
+<body>
+  <noscript>Esta app necesita JavaScript. Abrila en Safari.</noscript>
+  <div id="app">
+    <div class="pantalla"><p class="sec centrado">Cargando…</p></div>
+  </div>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>
