@@ -40,31 +40,34 @@ async function cargar(clave) {
     modeloCargado = null;
   }
 
-  const intentos = [];
-  if (await hayWebGPU()) intentos.push({ device: 'webgpu', dtype: def.dtype.webgpu });
-  intentos.push({ device: 'wasm', dtype: def.dtype.wasm });
+  const gpu = await hayWebGPU();
+  const intentos = def.intentos.filter(i => i.device !== 'webgpu' || gpu);
+  if (intentos.length === 0) {
+    throw new Error(`${def.titulo} necesita GPU (WebGPU) y este navegador no la tiene.`);
+  }
 
   let ultimoError = null;
-  for (const intento of intentos) {
+  for (let n = 0; n < intentos.length; n++) {
+    const intento = intentos[n];
     try {
-      enviar({ type: 'estado', texto: `Cargando ${def.titulo} (${intento.device})…` });
+      enviar({ type: 'intento', modelo: clave, numero: n + 1, total: intentos.length, etiqueta: intento.etiqueta });
       transcriptor = await pipeline('automatic-speech-recognition', def.id, {
         device: intento.device,
         dtype: intento.dtype,
         progress_callback: p => {
-          if (p && (p.status === 'progress' || p.status === 'download' || p.status === 'done')) {
+          if (p && (p.status === 'progress' || p.status === 'download' || p.status === 'done' || p.status === 'initiate')) {
             enviar({ type: 'progress', file: p.file, progress: p.progress, loaded: p.loaded, total: p.total, status: p.status });
           }
         },
       });
       modeloCargado = clave;
       dispositivo = intento.device;
-      enviar({ type: 'ready', modelo: clave, dispositivo });
+      enviar({ type: 'ready', modelo: clave, dispositivo, etiqueta: intento.etiqueta });
       return;
     } catch (e) {
       ultimoError = e;
       transcriptor = null;
-      enviar({ type: 'estado', texto: `No cargó con ${intento.device}: ${e && e.message ? e.message : e}` });
+      enviar({ type: 'estado', texto: `${def.titulo} (${intento.etiqueta}) no cargó: ${e && e.message ? e.message : e}` });
     }
   }
   throw ultimoError || new Error('No se pudo cargar el modelo');

@@ -2,7 +2,7 @@
 // - Archivos propios y librerías de CDN: se guardan en caché la primera vez.
 // - Modelos de Whisper (huggingface.co): los guarda Transformers.js por su cuenta en el Cache Storage del navegador.
 
-const VERSION = 'inspecciones-v1';
+const VERSION = 'inspecciones-v2';
 const PROPIOS = [
   './',
   './index.html',

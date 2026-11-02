@@ -2,7 +2,7 @@
 
 import { db, uuid, cargarLocalesSiHaceFalta } from './db.js';
 import { Grabadora, blobAPcm16k } from './audio.js';
-import { MODELOS, MODELO_POR_DEFECTO, CADENA_DE_RESPALDO } from './modelos.js';
+import { MODELOS, MODELO_POR_DEFECTO, CADENA_DE_RESPALDO, siguienteModelo } from './modelos.js';
 import { clasificar, resumir, CATEGORIAS, SEVERIDADES } from './clasificador.js';
 import { generarInforme } from './pdf.js';
 
@@ -10,7 +10,7 @@ const app = document.getElementById('app');
 const UMBRAL_METROS = 200;
 
 const estado = {
-  modelo: { fase: 'sinCargar', texto: 'Sin cargar', progreso: {}, clave: null, dispositivo: null, error: null },
+  modelo: { fase: 'sinCargar', texto: 'Sin cargar', progreso: {}, clave: null, dispositivo: null, error: null, pct: null, intentoTexto: '', inicioDescarga: 0 },
   gps: { pos: null, error: null, permiso: 'desconocido' },
   cola: { corriendo: false, enProceso: null, pendientes: 0 },
   vista: null,
@@ -100,12 +100,40 @@ function asegurarWorker() {
     ultimoMensajeWorker = Date.now();
     const m = e.data || {};
     if (m.type === 'progress') {
-      if (m.file) estado.modelo.progreso[m.file] = { loaded: m.loaded || 0, total: m.total || 0, progress: m.progress || 0 };
+      if (m.file) {
+        const prev = estado.modelo.progreso[m.file] || {};
+        estado.modelo.progreso[m.file] = {
+          loaded: m.status === 'done' ? (m.total || prev.total || prev.loaded || 0) : (m.loaded ?? prev.loaded ?? 0),
+          total: m.total || prev.total || 0,
+        };
+      }
       const archivos = Object.values(estado.modelo.progreso);
       const total = archivos.reduce((a, x) => a + (x.total || 0), 0);
-      const bajado = archivos.reduce((a, x) => a + (x.loaded || 0), 0);
+      const bajado = archivos.reduce((a, x) => a + Math.min(x.loaded || 0, x.total || x.loaded || 0), 0);
+      // Si en 2 segundos ya bajó más de 30 MB viene del caché del teléfono, no de internet.
+      if (!estado.modelo.inicioDescarga) estado.modelo.inicioDescarga = Date.now();
+      const seg = (Date.now() - estado.modelo.inicioDescarga) / 1000;
+      const velocidad = seg > 1 ? bajado / seg : 0;
+      const desdeCache = seg < 3 && bajado > 30e6;
+      const pct = total > 0 ? Math.round(bajado / total * 100) : null;
       estado.modelo.fase = 'descargando';
-      estado.modelo.texto = total > 0 ? `Descargando modelo… ${fmt.bytes(bajado)} de ${fmt.bytes(total)}` : 'Descargando modelo…';
+      estado.modelo.pct = pct;
+      const titulo = estado.modelo.intentoTexto || 'modelo';
+      if (desdeCache) estado.modelo.texto = `Cargando ${titulo} desde el teléfono… ${pct != null ? pct + '%' : ''}`;
+      else if (total > 0) {
+        const faltan = velocidad > 0 ? Math.max(0, (total - bajado) / velocidad) : null;
+        const eta = faltan == null ? '' : faltan > 90 ? ` · faltan ~${Math.round(faltan / 60)} min` : faltan > 5 ? ` · faltan ~${Math.round(faltan)} s` : '';
+        estado.modelo.texto = `Descargando ${titulo}: ${fmt.bytes(bajado)} de ${fmt.bytes(total)} (${pct}%)${eta}`;
+      } else estado.modelo.texto = `Descargando ${titulo}…`;
+      emitir('modelo');
+    } else if (m.type === 'intento') {
+      estado.modelo.progreso = {};
+      estado.modelo.inicioDescarga = 0;
+      estado.modelo.pct = null;
+      estado.modelo.intentoTexto = `${MODELOS[m.modelo].titulo}${m.total > 1 ? ` (${m.etiqueta}, intento ${m.numero} de ${m.total})` : ''}`;
+      estado.modelo.fase = 'cargando';
+      estado.modelo.texto = `Preparando ${estado.modelo.intentoTexto}…`;
+      marcarCargaEnCurso(m.modelo, m.numero);
       emitir('modelo');
     } else if (m.type === 'estado') {
       estado.modelo.texto = m.texto;
@@ -115,8 +143,10 @@ function asegurarWorker() {
       estado.modelo.fase = 'listo';
       estado.modelo.clave = m.modelo;
       estado.modelo.dispositivo = m.dispositivo;
-      estado.modelo.texto = `Listo · ${MODELOS[m.modelo].titulo} (${m.dispositivo === 'webgpu' ? 'GPU' : 'CPU'})`;
+      estado.modelo.pct = null;
+      estado.modelo.texto = `Listo · ${MODELOS[m.modelo].titulo}${m.etiqueta ? ` (${m.etiqueta})` : ''}`;
       estado.modelo.error = null;
+      limpiarCargaEnCurso();
       if (cargaActual) { cargaActual.resolve(m.modelo); cargaActual = null; }
       emitir('modelo');
     } else if (m.type === 'result') {
@@ -143,6 +173,46 @@ function asegurarWorker() {
   return worker;
 }
 let motorRoto = false;
+
+// --- Detección de reinicios de Safari ---------------------------------------------------
+// Si el modelo es demasiado grande, iOS mata la página sin aviso y la app vuelve a arrancar.
+// Dejamos una marca en localStorage mientras se carga; si al arrancar la marca sigue ahí,
+// la carga anterior no terminó. Dos veces seguidas con el mismo modelo → se baja al siguiente.
+const CLAVE_CARGA = 'cargaEnCurso';
+const CLAVE_REINICIOS = 'reiniciosPorModelo';
+
+function leerJSON(clave, porDefecto) {
+  try { const v = localStorage.getItem(clave); return v ? JSON.parse(v) : porDefecto; } catch (_) { return porDefecto; }
+}
+function escribirJSON(clave, valor) {
+  try { if (valor == null) localStorage.removeItem(clave); else localStorage.setItem(clave, JSON.stringify(valor)); } catch (_) {}
+}
+function marcarCargaEnCurso(modelo, intento) {
+  escribirJSON(CLAVE_CARGA, { modelo, intento, desde: Date.now() });
+}
+function limpiarCargaEnCurso() {
+  escribirJSON(CLAVE_CARGA, null);
+}
+/** Al arrancar: ¿quedó una carga a medias? Devuelve un aviso para el usuario o null. */
+async function revisarReinicioPorModelo() {
+  const marca = leerJSON(CLAVE_CARGA, null);
+  if (!marca || !marca.modelo) return null;
+  limpiarCargaEnCurso();
+  // Una recarga normal mientras se descargaba (por ejemplo, el usuario cerró la app) también deja la marca:
+  // por eso se exige que pase dos veces antes de cambiar de modelo.
+  const reinicios = leerJSON(CLAVE_REINICIOS, {});
+  reinicios[marca.modelo] = (reinicios[marca.modelo] || 0) + 1;
+  escribirJSON(CLAVE_REINICIOS, reinicios);
+  if (reinicios[marca.modelo] < 2) return null;
+  const elegido = await db.ajuste('modelo', MODELO_POR_DEFECTO);
+  if (elegido !== marca.modelo) return null;
+  const siguiente = siguienteModelo(marca.modelo);
+  if (!siguiente) return `${MODELOS[marca.modelo].titulo} no termina de cargar en este teléfono. Probá con otro modelo en Ajustes.`;
+  await db.setAjuste('modelo', siguiente);
+  reinicios[marca.modelo] = 0;
+  escribirJSON(CLAVE_REINICIOS, reinicios);
+  return `${MODELOS[marca.modelo].titulo} hizo que Safari reiniciara la app dos veces (se queda sin memoria). Se pasa a ${MODELOS[siguiente].titulo}. Podés volver a cambiarlo en Ajustes.`;
+}
 
 /** Espera la carga; si el worker no da señales de vida por un rato, lo da por colgado. */
 function esperarCarga(clavePromesa) {
@@ -187,10 +257,12 @@ function asegurarModelo() {
         return clave;
       } catch (e) {
         ultimo = e;
+        limpiarCargaEnCurso();
         estado.modelo.texto = `${MODELOS[clave].titulo}: ${e.message}`;
         emitir('modelo');
       }
     }
+    limpiarCargaEnCurso();
     estado.modelo.fase = 'error';
     estado.modelo.error = ultimo ? ultimo.message : 'No cargó ningún modelo';
     estado.modelo.texto = 'Error: ' + estado.modelo.error;
@@ -596,8 +668,15 @@ async function vistaGrabacion(id) {
     </div>`;
 }
 function pillModelo() {
-  const listo = estado.modelo.fase === 'listo';
-  return `<span class="punto ${listo ? 'ok' : 'aviso'}"></span><span>${listo ? 'Transcripción lista' : esc(estado.modelo.texto)}</span>`;
+  const m = estado.modelo;
+  const listo = m.fase === 'listo';
+  let texto;
+  if (listo) texto = 'Transcripción lista';
+  else if (m.fase === 'descargando') texto = m.pct != null ? `Modelo: ${m.pct}%` : 'Descargando modelo…';
+  else if (m.fase === 'cargando') texto = 'Preparando modelo…';
+  else if (m.fase === 'error') texto = 'Modelo: error';
+  else texto = 'Modelo sin cargar';
+  return `<span class="punto ${listo ? 'ok' : m.fase === 'error' ? 'err' : 'aviso'}"></span><span>${esc(texto)}</span>`;
 }
 function filaGrabado(h) {
   const principal = h.transcripcion ? tituloHallazgo(h) : `${fmt.duracion(h.duracion)}${h.fotoId ? ' · con foto' : ''}`;
@@ -1028,7 +1107,8 @@ async function vistaAjustes() {
         <div class="entre"><span>Estado</span><span class="sec" id="aj-estado">${esc(cargadoEste ? 'Listo' : m.texto)}</span></div>
         <div class="barra" id="aj-barra"></div>
         <button class="btn btn-sec" data-accion="cargar-modelo" ${cargadoEste || m.fase === 'descargando' || m.fase === 'cargando' ? 'disabled' : ''}>${cargadoEste ? 'Cargado' : 'Descargar y cargar ahora'}</button>
-        <p class="sec peq">La primera descarga necesita wifi y tarda varios minutos. Después funciona sin señal mientras Safari conserve el modelo; si lo borra por falta de espacio, se vuelve a bajar solo. ${webgpu ? 'Este navegador tiene aceleración por GPU.' : 'Este navegador no tiene WebGPU: va a usar la CPU, más lento.'}</p>
+        <p class="sec peq">La primera descarga necesita wifi y tarda varios minutos (1,5 GB son unos 5 min con un wifi normal). Dejá la app abierta y la pantalla encendida mientras baja. Después funciona sin señal mientras Safari conserve el modelo; si lo borra por falta de espacio, se vuelve a bajar solo. ${webgpu ? 'Este navegador tiene aceleración por GPU.' : 'Este navegador no tiene WebGPU: va a usar la CPU, más lento.'}</p>
+        <p class="sec peq">Si con large-v3-turbo la app se reinicia o vuelve a "Preparando modelo" una y otra vez, es que Safari se queda sin memoria: la app pasa sola a medium después de dos reinicios, o podés elegir medium o small acá mismo.</p>
       </div>
 
       <div class="etiqueta">CLASIFICACIÓN DE HALLAZGOS</div>
@@ -1239,13 +1319,13 @@ on('modelo', () => {
   if (est) est.textContent = estado.modelo.fase === 'listo' ? 'Listo' : estado.modelo.texto;
   const barra = document.getElementById('aj-barra');
   if (barra) {
-    const archivos = Object.values(estado.modelo.progreso);
-    const total = archivos.reduce((a, x) => a + (x.total || 0), 0);
-    const bajado = archivos.reduce((a, x) => a + (x.loaded || 0), 0);
-    barra.style.setProperty('--p', total ? `${Math.min(100, bajado / total * 100)}%` : '0%');
-    barra.classList.toggle('visible', estado.modelo.fase === 'descargando');
+    barra.style.setProperty('--p', estado.modelo.pct != null ? `${Math.min(100, estado.modelo.pct)}%` : '0%');
+    barra.classList.toggle('visible', estado.modelo.fase === 'descargando' && estado.modelo.pct != null);
   }
-  if (estado.vista === 'ajustes' && (estado.modelo.fase === 'listo' || estado.modelo.fase === 'error')) render();
+  const faseAnterior = on._faseAjustes;
+  on._faseAjustes = estado.modelo.fase;
+  // Redibuja Ajustes solo cuando cambia la fase (listo/error), no en cada avance de la descarga.
+  if (estado.vista === 'ajustes' && faseAnterior !== estado.modelo.fase && (estado.modelo.fase === 'listo' || estado.modelo.fase === 'error')) render();
 });
 on('hallazgo', h => {
   if (estado.vista === 'grabacion') refrescarListaGrabados();
@@ -1276,8 +1356,14 @@ async function arrancar() {
   if ('serviceWorker' in navigator) {
     try { await navigator.serviceWorker.register('./sw.js'); } catch (e) { console.warn('SW', e); }
   }
+  const aviso = await revisarReinicioPorModelo();
   iniciarGPS();
   await render();
+  if (aviso) {
+    toast(aviso, 'aviso');
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { const t = document.getElementById('toast'); if (t) t.className = ''; }, 12000);
+  }
   procesarPendientes();
 }
 arrancar();

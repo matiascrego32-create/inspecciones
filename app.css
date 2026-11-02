@@ -162,6 +162,7 @@ p { margin: 0; }
 .pill { display: inline-flex; align-items: center; gap: 6px; padding: 6px 10px; border-radius: 999px; background: var(--aviso-fondo); font-size: 12px; font-weight: 600; max-width: 170px; }
 .pill .punto { width: 8px; height: 8px; border-radius: 4px; background: var(--aviso); flex-shrink: 0; }
 .pill .punto.ok { background: var(--ok); }
+.pill .punto.err { background: var(--rojo); }
 .pill span:last-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
 .panel-grab { align-items: center; padding: 24px 16px 20px; gap: 14px; border-radius: 20px; }
