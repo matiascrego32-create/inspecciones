@@ -4,7 +4,8 @@
 import { db, uuid, cargarLocalesSiHaceFalta } from './db.js';
 import { Grabadora } from './audio.js';
 import { transcribirRemoto, wavDePrueba, MODELOS_GROQ, MODELO_GROQ_POR_DEFECTO, ErrorTranscripcion } from './groq.js';
-import { clasificar, resumir, CATEGORIAS, SEVERIDADES } from './clasificador.js';
+import { clasificar, resumir, CATEGORIAS, SEVERIDADES, RESPONSABLES_POR_DEFECTO, sugerirResponsable } from './clasificador.js';
+import { generarWord } from './word.js';
 import { generarInforme } from './pdf.js';
 
 const app = document.getElementById('app');
@@ -27,6 +28,22 @@ const AJUSTES_POR_DEFECTO = {
   servicioModelo: MODELO_GROQ_POR_DEFECTO,
   terminos: 'CANIMEL, CEDINA, CENEPA, Diálisis Rodo, FILSA, Uruguayana, INU, SEDIC, hemodiálisis, ósmosis, sillón, matafuego, sala de diálisis, planta de agua',
 };
+let responsablesCache = null;
+async function cargarResponsables() {
+  responsablesCache = await db.ajuste('responsables', RESPONSABLES_POR_DEFECTO);
+  return responsablesCache;
+}
+async function guardarResponsables(lista) {
+  const limpia = [];
+  for (const n of lista) {
+    const t = String(n || '').trim();
+    if (t && !limpia.some(x => x.toLowerCase() === t.toLowerCase())) limpia.push(t);
+  }
+  responsablesCache = limpia;
+  await db.setAjuste('responsables', limpia);
+  return limpia;
+}
+
 async function ajustesServicio() {
   const r = {};
   for (const k of Object.keys(AJUSTES_POR_DEFECTO)) r[k] = await db.ajuste(k, AJUSTES_POR_DEFECTO[k]);
@@ -198,6 +215,10 @@ async function procesarHallazgo(h, a) {
     if (!actual.descripcion) actual.descripcion = sug.descripcion;
     if (!actual.categoria) { actual.categoria = sug.categoria; actual.categoriaSugerida = true; }
     if (!actual.severidad) { actual.severidad = sug.severidad; actual.severidadSugerida = true; }
+    if (!actual.responsable) {
+      const r = sugerirResponsable(texto, responsablesCache || await cargarResponsables());
+      if (r) { actual.responsable = r; actual.responsableSugerido = true; }
+    }
     actual.estadoProceso = 'listo';
     actual.errorMensaje = null;
     await db.guardar('hallazgos', actual);
@@ -496,7 +517,7 @@ async function vistaPendientes(id) {
         <div class="col">
           <div class="t16">${esc(tituloHallazgo(h))}</div>
           <div class="badges">${badgeSeveridad(h.severidad)}${badgeCategoria(h.categoria)}</div>
-          ${h.visita ? `<div class="sec peq">Visita del ${fmt.fechaCorta(h.visita.inicio)}</div>` : ''}
+          ${h.visita ? `<div class="sec peq">Visita del ${fmt.fechaCorta(h.visita.inicio)}${h.responsable ? ` · ${esc(h.responsable)}` : ''}</div>` : ''}
         </div>
       </div>
       <div class="dos">
@@ -700,6 +721,7 @@ async function vistaRevision(id) {
   const hs = await db.hallazgosDeVisita(visita.id);
   const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
   const enProceso = hs.filter(h => h.estadoProceso === 'grabado' || h.estadoProceso === 'transcribiendo').length;
+  await cargarResponsables();
   return `
     <div class="pantalla con-pie" id="pantalla-revision">
       ${encabezado('Revisar visita', { atras: visita.estado === 'confirmada' ? { ruta: 'informe/' + visita.id, texto: 'Informe' } : { ruta: 'grabacion/' + visita.id, texto: 'Grabación' } })}
@@ -737,6 +759,10 @@ function tarjetaRevision(h) {
         <div class="segmentos">${seg}</div>
         ${!h.severidad ? '<div class="sec peq aviso-txt">Sin clasificar: elegí una.</div>' : ''}
       </div>
+      <div class="campo">
+        <span class="etiqueta-campo">Responsable${h.responsableSugerido ? ' <span class="sug">sugerido</span>' : ''}</span>
+        <div class="chips">${chipsResponsable(h)}</div>
+      </div>
       <div class="fila">
         <div class="foto-thumb chica" data-foto="${h.fotoId || ''}">${ICONO.camara}</div>
         <span class="sec">${h.fotoId ? 'Con foto' : 'Sin foto'}</span>
@@ -744,6 +770,13 @@ function tarjetaRevision(h) {
         <label class="btn btn-sec chico"><span>${h.fotoId ? 'Cambiar' : 'Agregar foto'}</span><input type="file" accept="image/*" capture="environment" hidden data-foto-para="${h.id}"></label>
       </div>
     </div>`;
+}
+function chipsResponsable(h) {
+  const lista = [...(responsablesCache || RESPONSABLES_POR_DEFECTO)];
+  // Si el hallazgo tiene un responsable que ya no está en la lista, se sigue mostrando.
+  if (h.responsable && !lista.includes(h.responsable)) lista.unshift(h.responsable);
+  return lista.map(n => `<button class="chip ${h.responsable === n ? 'activo' : ''}" data-accion="responsable" data-id="${h.id}" data-valor="${esc(n)}">${esc(n)}</button>`).join('')
+    + `<button class="chip chip-agregar" data-accion="nuevo-responsable" data-id="${h.id}">+ Otro</button>`;
 }
 vistaRevision.montar = cargarFotosThumb;
 
@@ -780,13 +813,7 @@ async function confirmarVisita(id) {
 }
 
 async function regenerarPDF(visita) {
-  const local = await db.uno('locales', visita.localId);
-  const nuevos = await db.hallazgosDeVisita(visita.id);
-  const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
-  const vmap = Object.fromEntries((await db.todos('visitas')).map(v => [v.id, v]));
-  resueltos.forEach(h => { h.visita = vmap[h.visitaId]; });
-  const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
-  const pdf = await generarInforme({ visita, local, nuevos, resueltos, siguenAbiertos, blobDe: id => db.blob(id) });
+  const pdf = await generarInforme(await datosInforme(visita));
   await db.borrarBlob(visita.pdfId);
   visita.pdfId = await db.guardarBlob(pdf, 'pdf');
   await db.guardar('visitas', visita);
@@ -812,14 +839,15 @@ async function vistaInforme(id) {
       <span class="inf-num">${i + 1}</span>
       <div class="col">
         <div class="t15">${esc(tituloHallazgo(h))}</div>
-        <div class="sec peq">${esc(tituloDe(CATEGORIAS, h.categoria) || 'Sin categoría')}${h.transcripcion ? ` · “${esc(h.transcripcion)}”` : ''}</div>
+        <div class="sec peq">${esc(tituloDe(CATEGORIAS, h.categoria) || 'Sin categoría')}${h.responsable ? ` · <strong>Responsable:</strong> ${esc(h.responsable)}` : ''}</div>
+        ${h.transcripcion ? `<div class="sec peq">“${esc(h.transcripcion)}”</div>` : ''}
         ${h.fotoId ? `<div class="foto-thumb inf-foto" data-foto="${h.fotoId}">${ICONO.camara}</div>` : ''}
       </div>
       ${badgeSeveridad(h.severidad)}
     </div>`;
   const filaPend = (h, estadoTxt, clase) => {
     const v = vmap[h.visitaId];
-    return `<div class="inf-fila"><div class="col"><div class="t15">${esc(tituloHallazgo(h))}</div>${v ? `<div class="sec peq">Visita del ${fmt.fechaCorta(v.inicio)}</div>` : ''}</div><span class="badge ${clase}">${estadoTxt}</span></div>`;
+    return `<div class="inf-fila"><div class="col"><div class="t15">${esc(tituloHallazgo(h))}</div>${v ? `<div class="sec peq">Visita del ${fmt.fechaCorta(v.inicio)}${h.responsable ? ` · ${esc(h.responsable)}` : ''}</div>` : ''}</div><span class="badge ${clase}">${estadoTxt}</span></div>`;
   };
 
   return `
@@ -839,13 +867,16 @@ async function vistaInforme(id) {
           ? resueltos.map(h => filaPend(h, 'Resuelto', 'badge-ok')).join('') + siguenAbiertos.map(h => filaPend(h, 'Sigue abierto', 'badge-urgente')).join('')
           : '<p class="sec peq">No había pendientes.</p>'}
       </div>
-      ${url ? `<a class="btn btn-sec" href="${url}" target="_blank" rel="noopener">${ICONO.doc}<span>Abrir el PDF</span></a>` : '<p class="sec centrado peq">Todavía no se generó el PDF de esta visita.</p>'}
+      <div class="dos">
+        ${url ? `<a class="btn btn-sec" href="${url}" target="_blank" rel="noopener">${ICONO.doc}<span>Ver PDF</span></a>` : ''}
+        <button class="btn btn-sec" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar</button>
+      </div>
+      <a class="btn btn-texto" href="#/revision/${visita.id}">Corregir hallazgos</a>
     </div>
     <div class="pie-fijo dos">
-      <button class="btn btn-sec" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar</button>
-      <button class="btn btn-pri" data-accion="compartir-pdf" data-id="${visita.id}" ${url ? '' : 'disabled'}>${ICONO.compartir}<span>Compartir PDF</span></button>
-    </div>
-    <div class="pie-fijo-extra"><a class="btn btn-texto" href="#/revision/${visita.id}">Corregir hallazgos</a></div>`;
+      <button class="btn btn-sec" data-accion="compartir-word" data-id="${visita.id}">${ICONO.doc}<span>Word</span></button>
+      <button class="btn btn-pri" data-accion="compartir-pdf" data-id="${visita.id}" ${url ? '' : 'disabled'}>${ICONO.compartir}<span>PDF</span></button>
+    </div>`;
 }
 vistaInforme.montar = cargarFotosThumb;
 
@@ -861,6 +892,37 @@ async function compartirPDF(id) {
   }
   descargar(blob, nombre);
 }
+async function datosInforme(visita) {
+  const local = await db.uno('locales', visita.localId);
+  const nuevos = await db.hallazgosDeVisita(visita.id);
+  const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
+  const vmap = Object.fromEntries((await db.todos('visitas')).map(v => [v.id, v]));
+  resueltos.forEach(h => { h.visita = vmap[h.visitaId]; });
+  const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
+  return { visita, local, nuevos, resueltos, siguenAbiertos, blobDe: id => db.blob(id) };
+}
+
+async function compartirWord(id, boton) {
+  const visita = await db.uno('visitas', id);
+  if (!visita) return;
+  const textoOriginal = boton ? boton.innerHTML : '';
+  if (boton) { boton.disabled = true; boton.innerHTML = '<span class="spinner"></span><span>Armando…</span>'; }
+  try {
+    const datos = await datosInforme(visita);
+    const blob = await generarWord(datos);
+    const nombre = `Inspeccion_${(datos.local ? datos.local.nombre : 'local').replace(/\s+/g, '_')}_${new Date(visita.inicio).toISOString().slice(0, 10)}.docx`;
+    const archivo = new File([blob], nombre, { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+    if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
+      try { await navigator.share({ files: [archivo], title: nombre }); return; } catch (e) { if (e.name === 'AbortError') return; }
+    }
+    descargar(blob, nombre);
+  } catch (e) {
+    toast('No se pudo armar el Word: ' + (e.message || e), 'error');
+  } finally {
+    if (boton) { boton.disabled = false; boton.innerHTML = textoOriginal; }
+  }
+}
+
 function descargar(blob, nombre) {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -978,6 +1040,7 @@ async function editarLocalDialogo(id) {
 
 async function vistaAjustes() {
   const a = await ajustesServicio();
+  const responsables = await cargarResponsables();
   const visitas = (await db.todos('visitas')).filter(v => v.estado === 'confirmada').length;
   const hallazgos = (await db.todos('hallazgos')).length;
   const locales = (await db.todos('locales')).length;
@@ -1022,6 +1085,17 @@ async function vistaAjustes() {
           <input type="password" autocapitalize="off" autocorrect="off" value="${esc(a.servicioClave)}" data-ajuste="servicioClave">
         </label>
       </details>
+
+      <div class="etiqueta">RESPONSABLES</div>
+      <div class="card">
+        <p class="sec peq">A quién le corresponde solucionar cada problema. Pueden ser roles (Electricista) o nombres (Juan Pérez, Empresa X). La app sugiere uno por palabras clave y se cambia con un toque en la revisión.</p>
+        <div class="chips">${responsables.map(n => `<span class="chip chip-quitar">${esc(n)}<button class="x" data-accion="quitar-responsable" data-valor="${esc(n)}" aria-label="Quitar ${esc(n)}">×</button></span>`).join('') || '<span class="sec peq">La lista está vacía.</span>'}</div>
+        <div class="fila">
+          <input id="nuevo-responsable" type="text" placeholder="Agregar nombre o rol" autocapitalize="sentences" style="flex:1">
+          <button class="btn btn-sec chico" data-accion="agregar-responsable-ajustes">Agregar</button>
+        </div>
+        <button class="btn-texto" data-accion="restaurar-responsables" style="align-self:flex-start">Volver a la lista original</button>
+      </div>
 
       <div class="etiqueta">TÉRMINOS PARA LA TRANSCRIPCIÓN</div>
       <div class="card">
@@ -1190,6 +1264,56 @@ app.addEventListener('click', async e => {
       reemplazarTarjetaRevision(h);
       break;
     }
+    case 'responsable': {
+      const h = await db.uno('hallazgos', id);
+      if (!h) return;
+      // Tocar el que ya está elegido lo quita.
+      h.responsable = h.responsable === el.dataset.valor && !h.responsableSugerido ? null : el.dataset.valor;
+      h.responsableSugerido = false;
+      await db.guardar('hallazgos', h);
+      reemplazarTarjetaRevision(h);
+      break;
+    }
+    case 'nuevo-responsable': {
+      const nombre = (prompt('Nombre o rol del responsable (por ejemplo: Electricista, Juan Pérez, Empresa de aire acondicionado):') || '').trim();
+      if (!nombre) return;
+      const lista = await cargarResponsables();
+      const existente = lista.find(x => x.toLowerCase() === nombre.toLowerCase());
+      if (!existente) await guardarResponsables([...lista, nombre]);
+      const h = await db.uno('hallazgos', id);
+      if (!h) return;
+      h.responsable = existente || nombre;
+      h.responsableSugerido = false;
+      await db.guardar('hallazgos', h);
+      // Actualiza todas las tarjetas para que el nuevo nombre aparezca en cada una.
+      for (const card of app.querySelectorAll('.tarjeta-rev')) {
+        const otro = await db.uno('hallazgos', card.dataset.hid);
+        if (otro) reemplazarTarjetaRevision(otro);
+      }
+      break;
+    }
+    case 'quitar-responsable': {
+      const lista = await cargarResponsables();
+      await guardarResponsables(lista.filter(x => x !== el.dataset.valor));
+      render();
+      break;
+    }
+    case 'agregar-responsable-ajustes': {
+      const input = document.getElementById('nuevo-responsable');
+      const nombre = (input && input.value || '').trim();
+      if (!nombre) return;
+      const lista = await cargarResponsables();
+      await guardarResponsables([...lista, nombre]);
+      render();
+      break;
+    }
+    case 'restaurar-responsables': {
+      if (!confirm('¿Volver a la lista de responsables original? Los hallazgos ya asignados no cambian.')) return;
+      await guardarResponsables(RESPONSABLES_POR_DEFECTO);
+      render();
+      break;
+    }
+    case 'compartir-word': compartirWord(id, el); break;
     case 'agregar-manual': agregarManual(el.dataset.visita); break;
     case 'confirmar-visita': confirmarVisita(id); break;
     case 'regenerar-pdf': {
@@ -1211,6 +1335,14 @@ app.addEventListener('click', async e => {
     }
     case 'procesar-ahora': estado.servicio.esperaHasta = 0; estado.servicio.ultimoError = null; procesarPendientes(); toast('Reintentando…'); break;
     case 'exportar-zip': exportarZip(); break;
+  }
+});
+
+app.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && e.target.id === 'nuevo-responsable') {
+    e.preventDefault();
+    const b = app.querySelector('[data-accion="agregar-responsable-ajustes"]');
+    if (b) b.click();
   }
 });
 

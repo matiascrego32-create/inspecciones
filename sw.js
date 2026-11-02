@@ -2,7 +2,7 @@
 // - Archivos propios y librerías de CDN: se guardan en caché la primera vez.
 // - La transcripción va a Groq a través del intermediario: red directa, sin caché.
 
-const VERSION = 'inspecciones-v3';
+const VERSION = 'inspecciones-v4';
 const PROPIOS = [
   './',
   './index.html',
@@ -11,6 +11,7 @@ const PROPIOS = [
   './db.js',
   './audio.js',
   './groq.js',
+  './word.js',
   './clasificador.js',
   './pdf.js',
   './manifest.webmanifest',
@@ -20,6 +21,7 @@ const PROPIOS = [
   './icons/icon-512-maskable.png',
   './lib/jspdf.umd.min.js',
   './lib/jszip.min.js',
+  './lib/docx.iife.js',
 ];
 const CDN = ['cdn.jsdelivr.net', 'cdnjs.cloudflare.com', 'unpkg.com'];
 

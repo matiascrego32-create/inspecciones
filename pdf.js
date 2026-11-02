@@ -148,8 +148,9 @@ export async function generarInforme({ visita, local, nuevos, resueltos, siguenA
     const wTexto = ancho - 24 - 70;
     y = yInicio;
     texto(h.descripcion || h.transcripcion || `Hallazgo ${h.orden}`, { size: 11, bold: true, x: xTexto, w: wTexto });
-    const meta = [titulo(CATEGORIAS, h.categoria), h.transcripcion ? `“${h.transcripcion}”` : ''].filter(Boolean).join(' · ');
-    if (meta) texto(meta, { size: 9.5, color: COLOR.gris, x: xTexto, w: wTexto });
+    const meta = [titulo(CATEGORIAS, h.categoria), h.responsable ? `Responsable: ${h.responsable}` : ''].filter(Boolean).join(' · ');
+    if (meta) texto(meta, { size: 9.5, color: [40, 40, 40], x: xTexto, w: wTexto });
+    if (h.transcripcion) texto(`“${h.transcripcion}”`, { size: 9.5, color: COLOR.gris, x: xTexto, w: wTexto });
     if (foto) {
       const w = Math.min(140, foto.w);
       const hImg = foto.h * (w / foto.w);
@@ -168,7 +169,7 @@ export async function generarInforme({ visita, local, nuevos, resueltos, siguenA
   const fila = (h, estado, color) => {
     asegurar(22);
     const yInicio = y;
-    const origen = h.visita ? ` (${fechaCorta(h.visita.inicio)})` : '';
+    const origen = (h.visita ? ` (${fechaCorta(h.visita.inicio)})` : '') + (h.responsable ? ` · ${h.responsable}` : '');
     texto((h.descripcion || h.transcripcion || 'Hallazgo') + origen, { size: 11, w: ancho - 90 });
     doc.setFont('helvetica', 'bold'); doc.setFontSize(10); doc.setTextColor(...color);
     doc.text(estado, M + ancho, yInicio + 11, { align: 'right' });

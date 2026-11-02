@@ -239,3 +239,7 @@ textarea { font-weight: 600; }
 .detalles[open] summary::after { content: " \25BE"; }
 code { font-size: 12px; background: var(--gris-fondo); padding: 2px 5px; border-radius: 5px; word-break: break-all; }
 input[type="url"], input[type="password"] { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid var(--borde); border-radius: 10px; background: var(--tarjeta); font-size: 16px; }
+
+.chip-agregar { border-style: dashed; color: var(--acento); }
+.chip-quitar { display: inline-flex; align-items: center; gap: 2px; padding-right: 4px; }
+.chip-quitar .x { border: 0; background: none; color: var(--sec); font-size: 18px; line-height: 1; width: 28px; height: 28px; padding: 0; }

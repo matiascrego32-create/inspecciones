@@ -29,6 +29,47 @@ const REGLAS_SEVERIDAD = [
   ['grave', ['roto', 'rota', 'no funciona', 'no anda', 'no prende', 'no enciende', 'vencid', 'falta', 'faltan', 'no hay', 'quemad', 'sin stock', 'fuga', 'pérdida', 'perdida', 'moho', 'humedad', 'caída', 'caida', 'piso mojado', 'reclamo', 'queja']],
 ];
 
+// Responsables: quién debería solucionar el problema. La lista es editable en la app;
+// estos son los que vienen al instalarla.
+export const RESPONSABLES_POR_DEFECTO = [
+  'Electricista',
+  'Técnico de ósmosis',
+  'Técnico de equipos',
+  'Sanitario',
+  'Climatización',
+  'Mantenimiento general',
+  'Limpieza',
+  'Compras / farmacia',
+  'Encargado del local',
+];
+
+// Reglas para sugerir responsable. Solo se usan si ese nombre sigue en la lista del usuario.
+const REGLAS_RESPONSABLE = [
+  ['Técnico de ósmosis', ['osmosis', 'ósmosis', 'planta de agua', 'tratamiento de agua', 'conductividad', 'cloro', 'filtro de agua', 'ablandador']],
+  ['Electricista', ['luz', 'luces', 'lampara', 'lámpara', 'luminaria', 'enchufe', 'toma', 'cable', 'electric', 'eléctric', 'tablero', 'llave', 'corto', 'no prende', 'no enciende', 'luz de emergencia', 'tubo']],
+  ['Técnico de equipos', ['maquina', 'máquina', 'monitor', 'dializador', 'equipo', 'balanza', 'bomba', 'alarma del equipo', 'heladera', 'calibra']],
+  ['Climatización', ['aire acondicionado', 'aire', 'calefacci', 'estufa', 'ventilaci', 'temperatura', 'calor', 'frio', 'frío']],
+  ['Sanitario', ['canilla', 'pérdida de agua', 'perdida de agua', 'fuga', 'inodoro', 'baño', 'desagüe', 'desague', 'cañería', 'caneria', 'humedad', 'goteo', 'gotera']],
+  ['Compras / farmacia', ['falta', 'faltan', 'no hay', 'stock', 'insumo', 'guante', 'barbijo', 'vencid', 'medicaci', 'farmacia', 'pedido']],
+  ['Limpieza', ['sucio', 'sucia', 'limpieza', 'limpiar', 'basura', 'mugre', 'polvo', 'olor', 'mancha', 'tacho', 'residuo']],
+  ['Mantenimiento general', ['roto', 'rota', 'sillon', 'sillón', 'silla', 'camilla', 'puerta', 'ventana', 'pared', 'techo', 'piso', 'pintura', 'tapizado', 'cartel', 'baranda', 'rampa', 'cerradura', 'matafuego', 'extintor']],
+  ['Encargado del local', ['atención', 'atencion', 'trato', 'espera', 'demora', 'personal', 'registro', 'planilla', 'uniforme', 'horario', 'turno', 'queja', 'reclamo']],
+];
+
+/** Sugiere un responsable de la lista según la transcripción. Devuelve el nombre o null. */
+export function sugerirResponsable(transcripcion, lista) {
+  const t = normalizar(transcripcion);
+  const disponibles = new Map((lista || []).map(n => [normalizar(n), n]));
+  let mejor = null, puntos = 0;
+  for (const [nombre, palabras] of REGLAS_RESPONSABLE) {
+    const real = disponibles.get(normalizar(nombre));
+    if (!real) continue;
+    const p = puntuar(t, palabras);
+    if (p > puntos) { puntos = p; mejor = real; }
+  }
+  return mejor;
+}
+
 function normalizar(s) {
   return (s || '').toLowerCase().normalize('NFD').replace(/[̀-ͯ]/g, '');
 }
