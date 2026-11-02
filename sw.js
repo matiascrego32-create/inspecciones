@@ -1,8 +1,8 @@
 // Service worker: deja la app usable sin conexión.
 // - Archivos propios y librerías de CDN: se guardan en caché la primera vez.
-// - Modelos de Whisper (huggingface.co): los guarda Transformers.js por su cuenta en el Cache Storage del navegador.
+// - La transcripción va a Groq a través del intermediario: red directa, sin caché.
 
-const VERSION = 'inspecciones-v2';
+const VERSION = 'inspecciones-v3';
 const PROPIOS = [
   './',
   './index.html',
@@ -10,8 +10,7 @@ const PROPIOS = [
   './app.js',
   './db.js',
   './audio.js',
-  './modelos.js',
-  './worker.js',
+  './groq.js',
   './clasificador.js',
   './pdf.js',
   './manifest.webmanifest',
@@ -43,7 +42,7 @@ self.addEventListener('fetch', e => {
   const url = new URL(req.url);
   const propio = url.origin === self.location.origin;
   const esCDN = CDN.includes(url.hostname);
-  if (!propio && !esCDN) return; // huggingface y otros: red directa (Transformers.js cachea los modelos)
+  if (!propio && !esCDN) return; // el servicio de transcripción y otros: red directa
 
   if (propio) {
     // Archivos de la app: red primero (para recibir actualizaciones), caché si no hay conexión.

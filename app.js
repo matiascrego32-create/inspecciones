@@ -1,8 +1,9 @@
-// Inspecciones · app web. Todo corre en el teléfono: grabación, transcripción (Whisper), PDF y datos.
+// Inspecciones · app web. Grabación, PDF y datos en el teléfono; transcripción con Whisper large-v3 en Groq
+// (nivel gratuito) a través de un intermediario propio que guarda la clave.
 
 import { db, uuid, cargarLocalesSiHaceFalta } from './db.js';
-import { Grabadora, blobAPcm16k } from './audio.js';
-import { MODELOS, MODELO_POR_DEFECTO, CADENA_DE_RESPALDO, siguienteModelo } from './modelos.js';
+import { Grabadora } from './audio.js';
+import { transcribirRemoto, wavDePrueba, MODELOS_GROQ, MODELO_GROQ_POR_DEFECTO, ErrorTranscripcion } from './groq.js';
 import { clasificar, resumir, CATEGORIAS, SEVERIDADES } from './clasificador.js';
 import { generarInforme } from './pdf.js';
 
@@ -10,13 +11,28 @@ const app = document.getElementById('app');
 const UMBRAL_METROS = 200;
 
 const estado = {
-  modelo: { fase: 'sinCargar', texto: 'Sin cargar', progreso: {}, clave: null, dispositivo: null, error: null, pct: null, intentoTexto: '', inicioDescarga: 0 },
+  // Servicio de transcripción: configurado = hay dirección; online = hay red; espera = hasta cuándo no reintentar (límite)
+  servicio: { configurado: false, online: navigator.onLine !== false, esperaHasta: 0, ultimoError: null, probando: false },
   gps: { pos: null, error: null, permiso: 'desconocido' },
   cola: { corriendo: false, enProceso: null, pendientes: 0 },
   vista: null,
   localElegido: null,
   siguenPendientes: new Set(),
 };
+
+const AJUSTES_POR_DEFECTO = {
+  servicioUrl: '',
+  servicioCodigo: '',
+  servicioClave: '',
+  servicioModelo: MODELO_GROQ_POR_DEFECTO,
+  terminos: 'CANIMEL, CEDINA, CENEPA, Diálisis Rodo, FILSA, Uruguayana, INU, SEDIC, hemodiálisis, ósmosis, sillón, matafuego, sala de diálisis, planta de agua',
+};
+async function ajustesServicio() {
+  const r = {};
+  for (const k of Object.keys(AJUSTES_POR_DEFECTO)) r[k] = await db.ajuste(k, AJUSTES_POR_DEFECTO[k]);
+  estado.servicio.configurado = !!(r.servicioUrl || '').trim();
+  return r;
+}
 
 // ---------------------------------------------------------------- utilidades
 
@@ -48,10 +64,16 @@ function badgeCategoria(cat) {
   return `<span class="badge badge-gris">${esc(cat ? tituloDe(CATEGORIAS, cat) : 'Sin categoría')}</span>`;
 }
 function etiquetaProceso(h) {
-  const esperandoModelo = h.estadoProceso === 'transcribiendo' && estado.modelo.fase !== 'listo';
+  let enCola = 'En cola';
+  if (h.estadoProceso === 'grabado') {
+    if (!estado.servicio.configurado) enCola = 'Falta configurar la transcripción';
+    else if (!estado.servicio.online) enCola = 'Esperando señal';
+    else if (estado.servicio.esperaHasta > Date.now()) enCola = 'Esperando (límite gratuito)';
+    else if (h.errorMensaje) enCola = 'Se reintenta';
+  }
   const m = {
-    grabado: ['⏱', 'En cola', ''],
-    transcribiendo: ['', esperandoModelo ? (estado.modelo.fase === 'descargando' ? 'Descargando modelo…' : 'Preparando modelo…') : 'Transcribiendo…', 'proc'],
+    grabado: ['⏱', enCola, ''],
+    transcribiendo: ['', 'Transcribiendo…', 'proc'],
     listo: ['✓', 'Transcrito', 'ok'],
     manual: ['✓', 'Manual', 'ok'],
     error: ['!', 'Error', 'err'],
@@ -77,228 +99,66 @@ function toast(msg, tipo = '') {
   toast._t = setTimeout(() => { t.className = ''; }, 3500);
 }
 
-// ---------------------------------------------------------------- modelo (worker)
+// ---------------------------------------------------------------- servicio de transcripción (Groq vía intermediario)
 
-let worker = null;
-const esperando = new Map();   // id de transcripción → {resolve, reject}
-let cargaActual = null;        // {resolve, reject} de la carga en curso
-let ultimoMensajeWorker = 0;   // para detectar un worker colgado
-
-function matarWorker(motivo) {
-  if (worker) { try { worker.terminate(); } catch (_) {} }
-  worker = null;
-  const err = new Error(motivo);
-  if (cargaActual) { cargaActual.reject(err); cargaActual = null; }
-  for (const [, p] of esperando) p.reject(err);
-  esperando.clear();
+let reintentoTimer = null;
+function programarReintento(segundos) {
+  clearTimeout(reintentoTimer);
+  reintentoTimer = setTimeout(() => { reintentoTimer = null; procesarPendientes(); }, Math.max(5, segundos) * 1000);
 }
 
-function asegurarWorker() {
-  if (worker) return worker;
-  worker = new Worker('./worker.js', { type: 'module' });
-  worker.onmessage = e => {
-    ultimoMensajeWorker = Date.now();
-    const m = e.data || {};
-    if (m.type === 'progress') {
-      if (m.file) {
-        const prev = estado.modelo.progreso[m.file] || {};
-        estado.modelo.progreso[m.file] = {
-          loaded: m.status === 'done' ? (m.total || prev.total || prev.loaded || 0) : (m.loaded ?? prev.loaded ?? 0),
-          total: m.total || prev.total || 0,
-        };
-      }
-      const archivos = Object.values(estado.modelo.progreso);
-      const total = archivos.reduce((a, x) => a + (x.total || 0), 0);
-      const bajado = archivos.reduce((a, x) => a + Math.min(x.loaded || 0, x.total || x.loaded || 0), 0);
-      // Si en 2 segundos ya bajó más de 30 MB viene del caché del teléfono, no de internet.
-      if (!estado.modelo.inicioDescarga) estado.modelo.inicioDescarga = Date.now();
-      const seg = (Date.now() - estado.modelo.inicioDescarga) / 1000;
-      const velocidad = seg > 1 ? bajado / seg : 0;
-      const desdeCache = seg < 3 && bajado > 30e6;
-      const pct = total > 0 ? Math.round(bajado / total * 100) : null;
-      estado.modelo.fase = 'descargando';
-      estado.modelo.pct = pct;
-      const titulo = estado.modelo.intentoTexto || 'modelo';
-      if (desdeCache) estado.modelo.texto = `Cargando ${titulo} desde el teléfono… ${pct != null ? pct + '%' : ''}`;
-      else if (total > 0) {
-        const faltan = velocidad > 0 ? Math.max(0, (total - bajado) / velocidad) : null;
-        const eta = faltan == null ? '' : faltan > 90 ? ` · faltan ~${Math.round(faltan / 60)} min` : faltan > 5 ? ` · faltan ~${Math.round(faltan)} s` : '';
-        estado.modelo.texto = `Descargando ${titulo}: ${fmt.bytes(bajado)} de ${fmt.bytes(total)} (${pct}%)${eta}`;
-      } else estado.modelo.texto = `Descargando ${titulo}…`;
-      emitir('modelo');
-    } else if (m.type === 'intento') {
-      estado.modelo.progreso = {};
-      estado.modelo.inicioDescarga = 0;
-      estado.modelo.pct = null;
-      estado.modelo.intentoTexto = `${MODELOS[m.modelo].titulo}${m.total > 1 ? ` (${m.etiqueta}, intento ${m.numero} de ${m.total})` : ''}`;
-      estado.modelo.fase = 'cargando';
-      estado.modelo.texto = `Preparando ${estado.modelo.intentoTexto}…`;
-      marcarCargaEnCurso(m.modelo, m.numero);
-      emitir('modelo');
-    } else if (m.type === 'estado') {
-      estado.modelo.texto = m.texto;
-      if (estado.modelo.fase !== 'descargando') estado.modelo.fase = 'cargando';
-      emitir('modelo');
-    } else if (m.type === 'ready') {
-      estado.modelo.fase = 'listo';
-      estado.modelo.clave = m.modelo;
-      estado.modelo.dispositivo = m.dispositivo;
-      estado.modelo.pct = null;
-      estado.modelo.texto = `Listo · ${MODELOS[m.modelo].titulo}${m.etiqueta ? ` (${m.etiqueta})` : ''}`;
-      estado.modelo.error = null;
-      limpiarCargaEnCurso();
-      if (cargaActual) { cargaActual.resolve(m.modelo); cargaActual = null; }
-      emitir('modelo');
-    } else if (m.type === 'result') {
-      const p = esperando.get(m.id); if (p) { esperando.delete(m.id); p.resolve(m.texto); }
-    } else if (m.type === 'error') {
-      if (m.id && esperando.has(m.id)) {
-        const p = esperando.get(m.id); esperando.delete(m.id); p.reject(new Error(m.message));
-      } else if (cargaActual) {
-        cargaActual.reject(new Error(m.message)); cargaActual = null;
-      } else {
-        estado.modelo.fase = 'error'; estado.modelo.texto = 'Error: ' + m.message; estado.modelo.error = m.message; emitir('modelo');
-      }
-    }
-  };
-  worker.onerror = e => {
-    // Casi siempre: no pudo bajar el motor de transcripción (sin conexión la primera vez).
-    const msg = navigator.onLine === false
-      ? 'Sin conexión. La primera vez hace falta internet para descargar el motor de transcripción.'
-      : 'No se pudo cargar el motor de transcripción. Revisá la conexión y reintentá.';
-    estado.modelo.fase = 'error'; estado.modelo.texto = 'Error: ' + msg; estado.modelo.error = msg; emitir('modelo');
-    matarWorker(msg);
-    motorRoto = true;
-  };
-  return worker;
-}
-let motorRoto = false;
+window.addEventListener('online', () => { estado.servicio.online = true; emitir('servicio'); procesarPendientes(); });
+window.addEventListener('offline', () => { estado.servicio.online = false; emitir('servicio'); });
 
-// --- Detección de reinicios de Safari ---------------------------------------------------
-// Si el modelo es demasiado grande, iOS mata la página sin aviso y la app vuelve a arrancar.
-// Dejamos una marca en localStorage mientras se carga; si al arrancar la marca sigue ahí,
-// la carga anterior no terminó. Dos veces seguidas con el mismo modelo → se baja al siguiente.
-const CLAVE_CARGA = 'cargaEnCurso';
-const CLAVE_REINICIOS = 'reiniciosPorModelo';
-
-function leerJSON(clave, porDefecto) {
-  try { const v = localStorage.getItem(clave); return v ? JSON.parse(v) : porDefecto; } catch (_) { return porDefecto; }
-}
-function escribirJSON(clave, valor) {
-  try { if (valor == null) localStorage.removeItem(clave); else localStorage.setItem(clave, JSON.stringify(valor)); } catch (_) {}
-}
-function marcarCargaEnCurso(modelo, intento) {
-  escribirJSON(CLAVE_CARGA, { modelo, intento, desde: Date.now() });
-}
-function limpiarCargaEnCurso() {
-  escribirJSON(CLAVE_CARGA, null);
-}
-/** Al arrancar: ¿quedó una carga a medias? Devuelve un aviso para el usuario o null. */
-async function revisarReinicioPorModelo() {
-  const marca = leerJSON(CLAVE_CARGA, null);
-  if (!marca || !marca.modelo) return null;
-  limpiarCargaEnCurso();
-  // Una recarga normal mientras se descargaba (por ejemplo, el usuario cerró la app) también deja la marca:
-  // por eso se exige que pase dos veces antes de cambiar de modelo.
-  const reinicios = leerJSON(CLAVE_REINICIOS, {});
-  reinicios[marca.modelo] = (reinicios[marca.modelo] || 0) + 1;
-  escribirJSON(CLAVE_REINICIOS, reinicios);
-  if (reinicios[marca.modelo] < 2) return null;
-  const elegido = await db.ajuste('modelo', MODELO_POR_DEFECTO);
-  if (elegido !== marca.modelo) return null;
-  const siguiente = siguienteModelo(marca.modelo);
-  if (!siguiente) return `${MODELOS[marca.modelo].titulo} no termina de cargar en este teléfono. Probá con otro modelo en Ajustes.`;
-  await db.setAjuste('modelo', siguiente);
-  reinicios[marca.modelo] = 0;
-  escribirJSON(CLAVE_REINICIOS, reinicios);
-  return `${MODELOS[marca.modelo].titulo} hizo que Safari reiniciara la app dos veces (se queda sin memoria). Se pasa a ${MODELOS[siguiente].titulo}. Podés volver a cambiarlo en Ajustes.`;
+/** Texto corto del estado del servicio, para la pastilla de Grabación y el pie de Inicio. */
+function textoServicio() {
+  const s = estado.servicio;
+  if (!s.configurado) return { texto: 'Falta configurar la transcripción', nivel: 'err' };
+  if (!s.online) return { texto: 'Sin señal: los audios esperan', nivel: 'aviso' };
+  if (s.esperaHasta > Date.now()) return { texto: `Límite gratuito: reintento ${fmt.hora(s.esperaHasta)}`, nivel: 'aviso' };
+  if (s.ultimoError) return { texto: s.ultimoError, nivel: 'err' };
+  if (estado.cola.corriendo) return { texto: 'Transcribiendo…', nivel: 'aviso' };
+  return { texto: 'Transcripción lista', nivel: 'ok' };
 }
 
-/** Espera la carga; si el worker no da señales de vida por un rato, lo da por colgado. */
-function esperarCarga(clavePromesa) {
-  return new Promise((resolve, reject) => {
-    let terminado = false;
-    const vigilante = setInterval(() => {
-      if (terminado) return;
-      if (Date.now() - ultimoMensajeWorker > 120000) {
-        clearInterval(vigilante);
-        terminado = true;
-        matarWorker('La descarga del modelo no avanza. Revisá la conexión y reintentá.');
-      }
-    }, 5000);
-    clavePromesa.then(v => { terminado = true; clearInterval(vigilante); resolve(v); },
-                      e => { terminado = true; clearInterval(vigilante); reject(e); });
-  });
-}
-
-let cargaEnCurso = null;
-/** Carga el modelo elegido; si falla, prueba los de respaldo. Devuelve la clave cargada. */
-function asegurarModelo() {
-  if (estado.modelo.fase === 'listo') return Promise.resolve(estado.modelo.clave);
-  if (cargaEnCurso) return cargaEnCurso;
-  cargaEnCurso = (async () => {
-    const elegido = await db.ajuste('modelo', MODELO_POR_DEFECTO);
-    const orden = [elegido, ...CADENA_DE_RESPALDO.filter(k => k !== elegido)];
-    let ultimo = null;
-    motorRoto = false;
-    for (const clave of orden) {
-      if (motorRoto) break; // sin motor no tiene sentido probar otros modelos
-      try {
-        estado.modelo.fase = 'cargando'; estado.modelo.progreso = {}; estado.modelo.texto = `Cargando ${MODELOS[clave].titulo}…`; emitir('modelo');
-        const w = asegurarWorker();
-        ultimoMensajeWorker = Date.now();
-        const clavePromesa = new Promise((resolve, reject) => { cargaActual = { resolve, reject }; });
-        w.postMessage({ type: 'load', modelo: clave });
-        await esperarCarga(clavePromesa);
-        if (clave !== elegido) {
-          toast(`${MODELOS[elegido].titulo} no cargó en este teléfono; se usa ${MODELOS[clave].titulo}.`, 'aviso');
-          await db.setAjuste('modelo', clave);
-        }
-        return clave;
-      } catch (e) {
-        ultimo = e;
-        limpiarCargaEnCurso();
-        estado.modelo.texto = `${MODELOS[clave].titulo}: ${e.message}`;
-        emitir('modelo');
-      }
-    }
-    limpiarCargaEnCurso();
-    estado.modelo.fase = 'error';
-    estado.modelo.error = ultimo ? ultimo.message : 'No cargó ningún modelo';
-    estado.modelo.texto = 'Error: ' + estado.modelo.error;
-    emitir('modelo');
-    throw ultimo || new Error('No cargó ningún modelo');
-  })().finally(() => { cargaEnCurso = null; });
-  return cargaEnCurso;
-}
-
-async function cambiarModelo(clave) {
-  await db.setAjuste('modelo', clave);
-  if (worker) worker.postMessage({ type: 'unload' });
-  estado.modelo.fase = 'sinCargar'; estado.modelo.clave = null; estado.modelo.texto = 'Sin cargar'; estado.modelo.progreso = {};
-  emitir('modelo');
-}
-
-function transcribirPcm(pcm) {
-  const id = uuid();
-  const w = asegurarWorker();
-  return new Promise((resolve, reject) => {
-    esperando.set(id, { resolve, reject });
-    w.postMessage({ type: 'transcribe', id, audio: pcm }, [pcm.buffer]);
-  });
+/** Prueba la conexión mandando un segundo de audio. Devuelve texto de resultado. */
+async function probarServicio() {
+  const a = await ajustesServicio();
+  estado.servicio.probando = true;
+  emitir('servicio');
+  try {
+    await transcribirRemoto({ blob: wavDePrueba(), url: a.servicioUrl.trim(), codigo: a.servicioCodigo.trim(), apiKey: a.servicioClave.trim(), modelo: a.servicioModelo, prompt: '' });
+    estado.servicio.ultimoError = null;
+    return { ok: true, texto: 'Conexión correcta: el servicio responde.' };
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    if (!(e instanceof ErrorTranscripcion) || !e.transitorio) estado.servicio.ultimoError = msg;
+    return { ok: false, texto: msg };
+  } finally {
+    estado.servicio.probando = false;
+    emitir('servicio');
+  }
 }
 
 // ---------------------------------------------------------------- cola de procesamiento
 
 async function procesarPendientes() {
   if (estado.cola.corriendo) return;
+  // Se marca antes de cualquier espera: dos llamadas casi simultáneas (por ejemplo, dos eventos "online")
+  // no deben mandar el mismo audio dos veces.
   estado.cola.corriendo = true;
   try {
+    if (estado.servicio.esperaHasta > Date.now()) { programarReintento((estado.servicio.esperaHasta - Date.now()) / 1000 + 1); return; }
+    const a = await ajustesServicio();
+    if (!estado.servicio.configurado) { emitir('servicio'); return; }
+    if (navigator.onLine === false) { estado.servicio.online = false; emitir('servicio'); return; }
+    emitir('servicio');
     let lista = await db.hallazgosPendientesDeProceso();
     estado.cola.pendientes = lista.length;
     while (lista.length > 0) {
       const h = lista[0];
-      await procesarHallazgo(h);
+      const seguir = await procesarHallazgo(h, a);
+      if (!seguir) break; // sin red o límite: se reintenta después
       lista = await db.hallazgosPendientesDeProceso();
       estado.cola.pendientes = lista.length;
     }
@@ -306,25 +166,33 @@ async function procesarPendientes() {
     estado.cola.corriendo = false;
     estado.cola.enProceso = null;
     emitir('cola');
+    emitir('servicio');
   }
 }
 
-async function procesarHallazgo(h) {
+/** Devuelve false si hay que cortar la cola (sin conexión, límite, servidor caído). */
+async function procesarHallazgo(h, a) {
   estado.cola.enProceso = h.id;
   h.estadoProceso = 'transcribiendo';
   h.errorMensaje = null;
   await db.guardar('hallazgos', h);
   emitir('hallazgo', h);
   try {
-    await asegurarModelo();
     const blob = await db.blob(h.audioId);
-    if (!blob) throw new Error('No se encontró el audio');
-    const pcm = await blobAPcm16k(blob);
-    const texto = await transcribirPcm(pcm);
-    if (!texto) throw new Error('No se reconoció voz en el audio');
-    // Puede haber sido borrado mientras se transcribía.
+    if (!blob) throw new ErrorTranscripcion('otro', 'No se encontró el audio');
+    const texto = await transcribirRemoto({
+      blob, url: a.servicioUrl.trim(), codigo: a.servicioCodigo.trim(), apiKey: a.servicioClave.trim(),
+      modelo: a.servicioModelo, prompt: a.terminos,
+    });
     const actual = await db.uno('hallazgos', h.id);
-    if (!actual) return;
+    if (!actual) return true; // lo borraron mientras tanto
+    if (!texto) {
+      actual.estadoProceso = 'error';
+      actual.errorMensaje = 'No se reconoció voz en el audio.';
+      await db.guardar('hallazgos', actual);
+      emitir('hallazgo', actual);
+      return true;
+    }
     actual.transcripcion = texto;
     const sug = clasificar(texto);
     if (!actual.descripcion) actual.descripcion = sug.descripcion;
@@ -333,14 +201,30 @@ async function procesarHallazgo(h) {
     actual.estadoProceso = 'listo';
     actual.errorMensaje = null;
     await db.guardar('hallazgos', actual);
+    estado.servicio.ultimoError = null;
     emitir('hallazgo', actual);
+    return true;
   } catch (e) {
     const actual = await db.uno('hallazgos', h.id);
-    if (!actual) return;
+    if (!actual) return true;
+    const msg = e && e.message ? e.message : String(e);
+    if (e instanceof ErrorTranscripcion && e.transitorio) {
+      // Vuelve a la cola; se reintenta cuando haya señal o pase la espera.
+      actual.estadoProceso = 'grabado';
+      actual.errorMensaje = msg;
+      await db.guardar('hallazgos', actual);
+      emitir('hallazgo', actual);
+      if (e.tipo === 'limite') { estado.servicio.esperaHasta = Date.now() + (e.esperarSegundos || 300) * 1000; programarReintento(e.esperarSegundos || 300); }
+      else if (e.tipo === 'red') { if (navigator.onLine === false) estado.servicio.online = false; else programarReintento(60); }
+      else programarReintento(120);
+      return false;
+    }
     actual.estadoProceso = 'error';
-    actual.errorMensaje = e && e.message ? e.message : String(e);
+    actual.errorMensaje = msg;
     await db.guardar('hallazgos', actual);
+    if (e instanceof ErrorTranscripcion && (e.tipo === 'clave' || e.tipo === 'config')) estado.servicio.ultimoError = msg;
     emitir('hallazgo', actual);
+    return e instanceof ErrorTranscripcion && e.tipo !== 'clave' && e.tipo !== 'config';
   }
 }
 
@@ -348,6 +232,8 @@ async function reintentar(h) {
   h.estadoProceso = 'grabado';
   h.errorMensaje = null;
   await db.guardar('hallazgos', h);
+  estado.servicio.ultimoError = null;
+  estado.servicio.esperaHasta = 0;
   emitir('hallazgo', h);
   procesarPendientes();
 }
@@ -520,6 +406,25 @@ async function vistaInicio() {
       </div>`;
   }
 
+  // Aviso de configuración o de audios esperando
+  await ajustesServicio();
+  const enCola = (await db.hallazgosPendientesDeProceso()).length;
+  let avisoServicio = '';
+  if (!estado.servicio.configurado) {
+    avisoServicio = `
+      <a class="card aviso-card" href="#/ajustes">
+        <div class="t16">Falta configurar la transcripción</div>
+        <div class="sec peq">Entrá a Ajustes y pegá la dirección del servicio. Mientras tanto podés grabar: los audios quedan en cola.</div>
+      </a>`;
+  } else if (enCola > 0) {
+    avisoServicio = `
+      <div class="card">
+        <div class="t16">${enCola} ${enCola === 1 ? 'audio esperando transcripción' : 'audios esperando transcripción'}</div>
+        <div class="sec peq">${esc(textoServicio().texto)}</div>
+        <button class="btn btn-sec chico" data-accion="procesar-ahora">Reintentar ahora</button>
+      </div>`;
+  }
+
   return `
     <div class="pantalla">
       <div class="enc">
@@ -533,15 +438,10 @@ async function vistaInicio() {
         <a class="item" href="#/locales">${ICONO.edificio}<span>Locales</span>${ICONO.chevron}</a>
         <a class="item" href="#/ajustes">${ICONO.ajustes}<span>Ajustes y respaldo</span>${ICONO.chevron}</a>
       </div>
+      ${avisoServicio}
       <div class="espacio"></div>
-      <p class="pie">Todo se guarda en este iPhone. Sin cuenta, sin servidor.<br>${modeloResumen()}</p>
+      <p class="pie">Los datos se guardan en este iPhone. Transcripción con Whisper large-v3 en Groq (gratis).<br><span id="pie-servicio">${esc(textoServicio().texto)}</span></p>
     </div>`;
-}
-function modeloResumen() {
-  const m = estado.modelo;
-  if (m.fase === 'listo') return `Transcripción: ${esc(MODELOS[m.clave].titulo)}`;
-  if (m.fase === 'sinCargar') return 'Transcripción: el modelo se carga al empezar a grabar';
-  return esc(m.texto);
 }
 
 async function elegirLocalDialogo() {
@@ -668,15 +568,8 @@ async function vistaGrabacion(id) {
     </div>`;
 }
 function pillModelo() {
-  const m = estado.modelo;
-  const listo = m.fase === 'listo';
-  let texto;
-  if (listo) texto = 'Transcripción lista';
-  else if (m.fase === 'descargando') texto = m.pct != null ? `Modelo: ${m.pct}%` : 'Descargando modelo…';
-  else if (m.fase === 'cargando') texto = 'Preparando modelo…';
-  else if (m.fase === 'error') texto = 'Modelo: error';
-  else texto = 'Modelo sin cargar';
-  return `<span class="punto ${listo ? 'ok' : m.fase === 'error' ? 'err' : 'aviso'}"></span><span>${esc(texto)}</span>`;
+  const t = textoServicio();
+  return `<span class="punto ${t.nivel}"></span><span>${esc(t.texto)}</span>`;
 }
 function filaGrabado(h) {
   const principal = h.transcripcion ? tituloHallazgo(h) : `${fmt.duracion(h.duracion)}${h.fotoId ? ' · con foto' : ''}`;
@@ -722,14 +615,15 @@ vistaGrabacion.montar = async () => {
         circulo.innerHTML = ICONO.stop;
         ayuda.textContent = 'Tocá de nuevo para parar';
         document.getElementById('btn-cerrar-visita').disabled = true;
-        asegurarModelo().catch(() => {});
       } catch (e) {
         err.textContent = e.name === 'NotAllowedError' ? 'Sin permiso de micrófono. Activalo en Ajustes → Safari → Micrófono.' : (e.message || 'No se pudo grabar');
       }
     }
   };
-  // Precalienta el modelo mientras el jefe empieza a recorrer.
-  asegurarModelo().catch(() => {});
+  await ajustesServicio();
+  const pill = document.getElementById('pill-modelo');
+  if (pill) pill.innerHTML = pillModelo();
+  procesarPendientes();
 };
 
 async function guardarGrabacion(blob, duracion) {
@@ -1083,37 +977,61 @@ async function editarLocalDialogo(id) {
 // ---- Ajustes
 
 async function vistaAjustes() {
-  const modelo = await db.ajuste('modelo', MODELO_POR_DEFECTO);
+  const a = await ajustesServicio();
   const visitas = (await db.todos('visitas')).filter(v => v.estado === 'confirmada').length;
   const hallazgos = (await db.todos('hallazgos')).length;
   const locales = (await db.todos('locales')).length;
   const uso = await db.tamanoAproximado();
-  const webgpu = 'gpu' in navigator;
-  const m = estado.modelo;
-  const cargadoEste = m.fase === 'listo' && m.clave === modelo;
+  const t = textoServicio();
   return `
     <div class="pantalla">
       ${encabezado('Ajustes y respaldo', { atras: { ruta: '', texto: 'Inicio' } })}
 
-      <div class="etiqueta">TRANSCRIPCIÓN (WHISPER, EN EL TELÉFONO)</div>
+      <div class="etiqueta">TRANSCRIPCIÓN (WHISPER LARGE-V3 EN GROQ)</div>
       <div class="card">
-        <div class="radios">
-          ${Object.entries(MODELOS).map(([k, d]) => `
-            <label class="radio ${modelo === k ? 'activo' : ''}">
-              <input type="radio" name="modelo" value="${k}" ${modelo === k ? 'checked' : ''} data-accion="modelo">
-              <span class="col"><span class="t16">${esc(d.titulo)} <span class="sec peq">${esc(d.tamano)}</span></span><span class="sec peq">${esc(d.detalle)}</span></span>
-            </label>`).join('')}
+        <label class="campo">
+          <span class="etiqueta-campo">Dirección del servicio</span>
+          <input type="url" inputmode="url" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="https://inspecciones.TU-USUARIO.workers.dev" value="${esc(a.servicioUrl)}" data-ajuste="servicioUrl">
+          <span class="sec peq">La dirección del intermediario (Cloudflare Worker) que guarda tu clave de Groq. Cómo crearlo: README del proyecto, 10 minutos, gratis.</span>
+        </label>
+        <label class="campo">
+          <span class="etiqueta-campo">Código de acceso (opcional)</span>
+          <input type="password" autocapitalize="off" autocorrect="off" placeholder="El mismo que pusiste en el Worker como APP_CODE" value="${esc(a.servicioCodigo)}" data-ajuste="servicioCodigo">
+        </label>
+        <div class="campo">
+          <span class="etiqueta-campo">Modelo</span>
+          <div class="radios">
+            ${Object.entries(MODELOS_GROQ).map(([k, d]) => `
+              <label class="radio ${a.servicioModelo === k ? 'activo' : ''}">
+                <input type="radio" name="servicioModelo" value="${k}" ${a.servicioModelo === k ? 'checked' : ''} data-ajuste="servicioModelo">
+                <span class="col"><span class="t16">${esc(d.titulo)}</span><span class="sec peq">${esc(d.detalle)}</span></span>
+              </label>`).join('')}
+          </div>
         </div>
-        <div class="entre"><span>Estado</span><span class="sec" id="aj-estado">${esc(cargadoEste ? 'Listo' : m.texto)}</span></div>
-        <div class="barra" id="aj-barra"></div>
-        <button class="btn btn-sec" data-accion="cargar-modelo" ${cargadoEste || m.fase === 'descargando' || m.fase === 'cargando' ? 'disabled' : ''}>${cargadoEste ? 'Cargado' : 'Descargar y cargar ahora'}</button>
-        <p class="sec peq">La primera descarga necesita wifi y tarda varios minutos (1,5 GB son unos 5 min con un wifi normal). Dejá la app abierta y la pantalla encendida mientras baja. Después funciona sin señal mientras Safari conserve el modelo; si lo borra por falta de espacio, se vuelve a bajar solo. ${webgpu ? 'Este navegador tiene aceleración por GPU.' : 'Este navegador no tiene WebGPU: va a usar la CPU, más lento.'}</p>
-        <p class="sec peq">Si con large-v3-turbo la app se reinicia o vuelve a "Preparando modelo" una y otra vez, es que Safari se queda sin memoria: la app pasa sola a medium después de dos reinicios, o podés elegir medium o small acá mismo.</p>
+        <div class="entre"><span>Estado</span><span class="sec" id="aj-estado">${esc(t.texto)}</span></div>
+        <button class="btn btn-sec" data-accion="probar-servicio" ${estado.servicio.probando ? 'disabled' : ''}>${estado.servicio.probando ? 'Probando…' : 'Probar conexión'}</button>
+        <div class="sec peq" id="aj-prueba"></div>
+        <p class="sec peq">Cada audio se envía a Groq para transcribirlo con Whisper large-v3 (nivel gratuito: hasta 8 horas de audio por día). Si no hay señal, los audios quedan en cola y se transcriben cuando vuelve.</p>
+      </div>
+
+      <details class="card detalles">
+        <summary class="t16">Avanzado: llamar a Groq directo (sin intermediario)</summary>
+        <p class="sec peq">Groq no acepta pedidos directos desde el navegador en la mayoría de los casos, y la clave quedaría guardada en este teléfono. Usalo solo si sabés lo que hacés: dirección <code>https://api.groq.com/openai/v1/audio/transcriptions</code> y la clave acá.</p>
+        <label class="campo">
+          <span class="etiqueta-campo">Clave de Groq (gsk_…)</span>
+          <input type="password" autocapitalize="off" autocorrect="off" value="${esc(a.servicioClave)}" data-ajuste="servicioClave">
+        </label>
+      </details>
+
+      <div class="etiqueta">TÉRMINOS PARA LA TRANSCRIPCIÓN</div>
+      <div class="card">
+        <textarea rows="3" data-ajuste="terminos" placeholder="Nombres de locales y palabras internas, separados por coma">${esc(a.terminos)}</textarea>
+        <p class="sec peq">Se le pasan a Whisper como contexto para que escriba bien los nombres propios y la jerga (CEDINA, SEDIC, ósmosis…).</p>
       </div>
 
       <div class="etiqueta">CLASIFICACIÓN DE HALLAZGOS</div>
       <div class="card">
-        <p class="sec">En la versión web no hay modelo de lenguaje local. La app <strong>sugiere</strong> categoría y severidad por palabras clave de la transcripción, y el jefe confirma o corrige con un toque en la revisión.</p>
+        <p class="sec">La app <strong>sugiere</strong> categoría y severidad por palabras clave de la transcripción, y el jefe confirma o corrige con un toque en la revisión.</p>
       </div>
 
       <div class="etiqueta">COPIA DE SEGURIDAD</div>
@@ -1130,10 +1048,21 @@ async function vistaAjustes() {
         <div><div class="t22">${hallazgos}</div><div class="sec peq">hallazgos</div></div>
         <div><div class="t22">${locales}</div><div class="sec peq">locales</div></div>
       </div>
-      <p class="sec peq centrado">Espacio usado (datos y modelo): ${uso ? fmt.bytes(uso) : 'no disponible'}</p>
+      <p class="sec peq centrado">Espacio usado: ${uso ? fmt.bytes(uso) : 'no disponible'}</p>
 
-      <p class="pie">Nada sale del teléfono salvo el respaldo que exportás. Sin cuenta, sin servidor.</p>
+      <p class="pie">Del teléfono solo salen los audios hacia Groq para transcribirlos, y el respaldo que exportás vos.</p>
     </div>`;
+}
+
+let ajusteTimer = null;
+async function guardarAjuste(clave, valor) {
+  await db.setAjuste(clave, valor);
+  if (clave === 'servicioUrl' || clave === 'servicioCodigo' || clave === 'servicioClave') {
+    estado.servicio.ultimoError = null;
+    estado.servicio.esperaHasta = 0;
+    await ajustesServicio();
+    emitir('servicio');
+  }
 }
 
 async function exportarZip() {
@@ -1271,7 +1200,16 @@ app.addEventListener('click', async e => {
     case 'compartir-pdf': compartirPDF(id); break;
     case 'filtro-local': filtroLocal = el.dataset.valor || null; render(); break;
     case 'editar-local': editarLocalDialogo(id); break;
-    case 'cargar-modelo': asegurarModelo().catch(err => toast(err.message, 'error')); break;
+    case 'probar-servicio': {
+      const info = document.getElementById('aj-prueba');
+      if (info) info.textContent = 'Probando…';
+      el.disabled = true;
+      const r = await probarServicio();
+      el.disabled = false;
+      if (info) { info.textContent = r.texto; info.className = 'sec peq ' + (r.ok ? 'ok-txt' : 'rojo'); }
+      break;
+    }
+    case 'procesar-ahora': estado.servicio.esperaHasta = 0; estado.servicio.ultimoError = null; procesarPendientes(); toast('Reintentando…'); break;
     case 'exportar-zip': exportarZip(); break;
   }
 });
@@ -1280,12 +1218,21 @@ app.addEventListener('change', async e => {
   const t = e.target;
   if (t.matches('[data-foto-para]')) { await guardarFoto(t.dataset.fotoPara, t.files && t.files[0]); t.value = ''; return; }
   if (t.matches('[data-accion="importar-zip"]')) { await importarZip(t.files && t.files[0]); t.value = ''; return; }
-  if (t.matches('[data-accion="modelo"]')) { await cambiarModelo(t.value); render(); return; }
+  if (t.matches('[data-ajuste]')) {
+    await guardarAjuste(t.dataset.ajuste, t.type === 'checkbox' ? t.checked : t.value.trim());
+    if (t.type === 'radio') render();
+    return;
+  }
 });
 
 let guardadoTimer = null;
 app.addEventListener('input', e => {
   const t = e.target;
+  if (t.matches('[data-ajuste]') && t.type !== 'radio') {
+    clearTimeout(ajusteTimer);
+    ajusteTimer = setTimeout(() => guardarAjuste(t.dataset.ajuste, t.value.trim()), 400);
+    return;
+  }
   if (!t.matches('[data-campo="descripcion"]')) return;
   clearTimeout(guardadoTimer);
   guardadoTimer = setTimeout(async () => {
@@ -1311,21 +1258,18 @@ async function reemplazarTarjetaRevision(h) {
 
 // ---------------------------------------------------------------- reacciones a eventos internos
 
-on('modelo', () => {
+on('servicio', () => {
   const pill = document.getElementById('pill-modelo');
   if (pill) pill.innerHTML = pillModelo();
-  if (estado.vista === 'grabacion') refrescarListaGrabados();
+  const t = textoServicio();
   const est = document.getElementById('aj-estado');
-  if (est) est.textContent = estado.modelo.fase === 'listo' ? 'Listo' : estado.modelo.texto;
-  const barra = document.getElementById('aj-barra');
-  if (barra) {
-    barra.style.setProperty('--p', estado.modelo.pct != null ? `${Math.min(100, estado.modelo.pct)}%` : '0%');
-    barra.classList.toggle('visible', estado.modelo.fase === 'descargando' && estado.modelo.pct != null);
-  }
-  const faseAnterior = on._faseAjustes;
-  on._faseAjustes = estado.modelo.fase;
-  // Redibuja Ajustes solo cuando cambia la fase (listo/error), no en cada avance de la descarga.
-  if (estado.vista === 'ajustes' && faseAnterior !== estado.modelo.fase && (estado.modelo.fase === 'listo' || estado.modelo.fase === 'error')) render();
+  if (est) est.textContent = t.texto;
+  const pie = document.getElementById('pie-servicio');
+  if (pie) pie.textContent = t.texto;
+  if (estado.vista === 'grabacion') refrescarListaGrabados();
+});
+on('cola', () => {
+  if (estado.vista === '' && !renderizando) render();
 });
 on('hallazgo', h => {
   if (estado.vista === 'grabacion') refrescarListaGrabados();
@@ -1356,14 +1300,9 @@ async function arrancar() {
   if ('serviceWorker' in navigator) {
     try { await navigator.serviceWorker.register('./sw.js'); } catch (e) { console.warn('SW', e); }
   }
-  const aviso = await revisarReinicioPorModelo();
+  await ajustesServicio();
   iniciarGPS();
   await render();
-  if (aviso) {
-    toast(aviso, 'aviso');
-    clearTimeout(toast._t);
-    toast._t = setTimeout(() => { const t = document.getElementById('toast'); if (t) t.className = ''; }, 12000);
-  }
   procesarPendientes();
 }
 arrancar();

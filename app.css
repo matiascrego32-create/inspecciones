@@ -230,3 +230,12 @@ textarea { font-weight: 600; }
 #toast.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
 #toast.error { background: var(--rojo-txt); }
 #toast.aviso { background: var(--aviso); }
+
+.aviso-card { border: 1px solid var(--aviso); color: var(--texto); }
+.ok-txt { color: var(--ok); }
+.detalles summary { cursor: pointer; list-style: none; }
+.detalles summary::-webkit-details-marker { display: none; }
+.detalles summary::after { content: " \25B8"; color: var(--sec); }
+.detalles[open] summary::after { content: " \25BE"; }
+code { font-size: 12px; background: var(--gris-fondo); padding: 2px 5px; border-radius: 5px; word-break: break-all; }
+input[type="url"], input[type="password"] { width: 100%; min-height: 46px; padding: 10px 12px; border: 1px solid var(--borde); border-radius: 10px; background: var(--tarjeta); font-size: 16px; }
