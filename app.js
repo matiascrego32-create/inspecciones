@@ -878,20 +878,93 @@ async function vistaInforme(id) {
       <button class="btn btn-pri" data-accion="compartir-pdf" data-id="${visita.id}" ${url ? '' : 'disabled'}>${ICONO.compartir}<span>PDF</span></button>
     </div>`;
 }
-vistaInforme.montar = cargarFotosThumb;
+// Los archivos se preparan apenas se abre el informe. En iPhone, Safari solo abre el menú de compartir
+// si se llama en el mismo instante del toque: si antes hay que esperar a armar el archivo, lo bloquea
+// y WhatsApp nunca aparece.
+const archivosListos = { visitaId: null, pdf: null, word: null, preparando: null };
 
-async function compartirPDF(id) {
-  const visita = await db.uno('visitas', id);
-  const local = await db.uno('locales', visita.localId);
-  const blob = await db.blob(visita.pdfId);
-  if (!blob) { toast('No hay PDF', 'error'); return; }
-  const nombre = `Inspeccion_${(local ? local.nombre : 'local').replace(/\s+/g, '_')}_${new Date(visita.inicio).toISOString().slice(0, 10)}.pdf`;
-  const archivo = new File([blob], nombre, { type: 'application/pdf' });
-  if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
-    try { await navigator.share({ files: [archivo], title: nombre }); return; } catch (e) { if (e.name === 'AbortError') return; }
-  }
-  descargar(blob, nombre);
+function nombreArchivo(local, visita, ext) {
+  return `Inspeccion_${(local ? local.nombre : 'local').replace(/[^\wÁÉÍÓÚÑáéíóúñ-]+/g, '_')}_${new Date(visita.inicio).toISOString().slice(0, 10)}.${ext}`;
 }
+
+async function prepararArchivos(visitaId) {
+  archivosListos.visitaId = visitaId;
+  archivosListos.pdf = null;
+  archivosListos.word = null;
+  const tarea = (async () => {
+    const visita = await db.uno('visitas', visitaId);
+    if (!visita) return;
+    const datos = await datosInforme(visita);
+    const pdfBlob = await db.blob(visita.pdfId);
+    if (archivosListos.visitaId !== visitaId) return;
+    if (pdfBlob) archivosListos.pdf = new File([pdfBlob], nombreArchivo(datos.local, visita, 'pdf'), { type: 'application/pdf' });
+    try {
+      const wordBlob = await generarWord(datos);
+      if (archivosListos.visitaId !== visitaId) return;
+      archivosListos.word = new File([wordBlob], nombreArchivo(datos.local, visita, 'docx'), { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+    } catch (e) {
+      console.warn('Word', e);
+    }
+  })();
+  archivosListos.preparando = tarea;
+  await tarea;
+  marcarBotonesListos();
+}
+
+function marcarBotonesListos() {
+  for (const tipo of ['pdf', 'word']) {
+    const b = app.querySelector(`[data-accion="compartir-${tipo}"]`);
+    if (!b) continue;
+    const listo = !!archivosListos[tipo];
+    b.disabled = !listo;
+    const etiqueta = b.querySelector('span:last-child');
+    if (etiqueta) etiqueta.textContent = listo ? (tipo === 'pdf' ? 'PDF' : 'Word') : 'Preparando…';
+  }
+}
+
+vistaInforme.montar = async id => {
+  cargarFotosThumb();
+  marcarBotonesListos();
+  prepararArchivos(id); // sin esperar: la pantalla queda usable mientras se arman
+};
+
+/** Se llama sin ninguna espera previa, directo desde el toque. */
+function compartirArchivo(tipo, id) {
+  const archivo = archivosListos.visitaId === id ? archivosListos[tipo] : null;
+  if (!archivo) { toast('El archivo todavía se está preparando. Probá de nuevo en un segundo.'); return; }
+  // Solo el archivo, sin título ni texto: con texto, WhatsApp en iPhone a veces manda solo el texto.
+  if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [archivo] }))) {
+    navigator.share({ files: [archivo] }).catch(e => {
+      if (e && e.name === 'AbortError') return;
+      if (e && e.name === 'NotAllowedError') { ofrecerCompartir(archivo); return; }
+      descargar(archivo, archivo.name);
+    });
+    return;
+  }
+  descargar(archivo, archivo.name);
+}
+
+/** Plan B si iOS rechazó el primer intento: un botón nuevo, que es un toque nuevo. */
+function ofrecerCompartir(archivo) {
+  const hoja = document.createElement('div');
+  hoja.className = 'hoja';
+  hoja.innerHTML = `
+    <div class="hoja-panel">
+      <div class="hoja-enc"><strong>${esc(archivo.name)}</strong><button class="btn-texto" data-cerrar>Cerrar</button></div>
+      <button class="btn btn-pri grande" data-compartir>${ICONO.compartir}<span>Compartir</span></button>
+      <button class="btn btn-sec" data-guardar>Guardar en Archivos</button>
+    </div>`;
+  document.body.appendChild(hoja);
+  hoja.addEventListener('click', e => {
+    if (e.target.closest('[data-compartir]')) {
+      navigator.share({ files: [archivo] }).then(() => hoja.remove()).catch(err => { if (err && err.name !== 'AbortError') descargar(archivo, archivo.name); });
+      return;
+    }
+    if (e.target.closest('[data-guardar]')) { descargar(archivo, archivo.name); hoja.remove(); return; }
+    if (e.target.closest('[data-cerrar]') || e.target === hoja) hoja.remove();
+  });
+}
+
 async function datosInforme(visita) {
   const local = await db.uno('locales', visita.localId);
   const nuevos = await db.hallazgosDeVisita(visita.id);
@@ -900,27 +973,6 @@ async function datosInforme(visita) {
   resueltos.forEach(h => { h.visita = vmap[h.visitaId]; });
   const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
   return { visita, local, nuevos, resueltos, siguenAbiertos, blobDe: id => db.blob(id) };
-}
-
-async function compartirWord(id, boton) {
-  const visita = await db.uno('visitas', id);
-  if (!visita) return;
-  const textoOriginal = boton ? boton.innerHTML : '';
-  if (boton) { boton.disabled = true; boton.innerHTML = '<span class="spinner"></span><span>Armando…</span>'; }
-  try {
-    const datos = await datosInforme(visita);
-    const blob = await generarWord(datos);
-    const nombre = `Inspeccion_${(datos.local ? datos.local.nombre : 'local').replace(/\s+/g, '_')}_${new Date(visita.inicio).toISOString().slice(0, 10)}.docx`;
-    const archivo = new File([blob], nombre, { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
-    if (navigator.canShare && navigator.canShare({ files: [archivo] })) {
-      try { await navigator.share({ files: [archivo], title: nombre }); return; } catch (e) { if (e.name === 'AbortError') return; }
-    }
-    descargar(blob, nombre);
-  } catch (e) {
-    toast('No se pudo armar el Word: ' + (e.message || e), 'error');
-  } finally {
-    if (boton) { boton.disabled = false; boton.innerHTML = textoOriginal; }
-  }
 }
 
 function descargar(blob, nombre) {
@@ -1313,7 +1365,7 @@ app.addEventListener('click', async e => {
       render();
       break;
     }
-    case 'compartir-word': compartirWord(id, el); break;
+    case 'compartir-word': compartirArchivo('word', id); break;
     case 'agregar-manual': agregarManual(el.dataset.visita); break;
     case 'confirmar-visita': confirmarVisita(id); break;
     case 'regenerar-pdf': {
@@ -1321,7 +1373,7 @@ app.addEventListener('click', async e => {
       try { await regenerarPDF(v); toast('Informe regenerado'); render(); } catch (err) { toast('No se pudo generar el PDF: ' + (err.message || err), 'error'); }
       break;
     }
-    case 'compartir-pdf': compartirPDF(id); break;
+    case 'compartir-pdf': compartirArchivo('pdf', id); break;
     case 'filtro-local': filtroLocal = el.dataset.valor || null; render(); break;
     case 'editar-local': editarLocalDialogo(id); break;
     case 'probar-servicio': {
