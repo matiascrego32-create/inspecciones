@@ -2,7 +2,7 @@
 // - Archivos propios y librerías de CDN: se guardan en caché la primera vez.
 // - La transcripción va a Groq a través del intermediario: red directa, sin caché.
 
-const VERSION = 'inspecciones-v9';
+const VERSION = 'inspecciones-v10';
 const PROPIOS = [
   './',
   './index.html',

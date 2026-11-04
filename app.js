@@ -8,6 +8,7 @@ import { clasificar, resumir, CATEGORIAS, SEVERIDADES, RESPONSABLES_POR_DEFECTO,
 import { generarWord } from './word.js';
 import { generarInforme } from './pdf.js';
 
+export const VERSION_APP = '10 (4 nov 2026)';
 const app = document.getElementById('app');
 const UMBRAL_METROS = 200;
 
@@ -1319,6 +1320,7 @@ async function vistaAjustes() {
       <p class="sec peq centrado">Espacio usado: ${uso ? fmt.bytes(uso) : 'no disponible'}</p>
 
       <p class="pie">Del teléfono solo salen los audios hacia Groq para transcribirlos, y el respaldo que exportás vos.</p>
+      <p class="pie">Versión ${VERSION_APP}</p>
     </div>`;
 }
 
@@ -1628,7 +1630,19 @@ async function arrancar() {
   await cargarLocalesSiHaceFalta();
   if (navigator.storage && navigator.storage.persist) { try { await navigator.storage.persist(); } catch (_) {} }
   if ('serviceWorker' in navigator) {
-    try { await navigator.serviceWorker.register('./sw.js'); } catch (e) { console.warn('SW', e); }
+    try {
+      const reg = await navigator.serviceWorker.register('./sw.js', { updateViaCache: 'none' });
+      // Busca versión nueva al abrir y cada vez que la app vuelve a primer plano.
+      reg.update().catch(() => {});
+      document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') reg.update().catch(() => {}); });
+      // Cuando se activa una versión nueva, recarga (salvo que esté grabando).
+      let recargando = false;
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        if (recargando || (grabadora && grabadora.grabando)) return;
+        recargando = true;
+        location.reload();
+      });
+    } catch (e) { console.warn('SW', e); }
   }
   await ajustesServicio();
   iniciarGPS();
