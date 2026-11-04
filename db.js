@@ -134,12 +134,13 @@ export const db = {
   },
   /** Hallazgos abiertos del local, de visitas confirmadas, urgentes primero. */
   async hallazgosAbiertosDeLocal(localId) {
-    const visitas = (await this.visitasDeLocal(localId)).filter(v => v.estado === 'confirmada');
+    // Las visitas y los hallazgos ocultos no se arrastran como pendientes.
+    const visitas = (await this.visitasDeLocal(localId)).filter(v => v.estado === 'confirmada' && !v.oculta);
     const porVisita = await Promise.all(visitas.map(v => this.hallazgosDeVisita(v.id)));
     const peso = { urgente: 0, grave: 1, leve: 2 };
     const vmap = Object.fromEntries(visitas.map(v => [v.id, v]));
     return porVisita.flat()
-      .filter(h => h.estado === 'abierto')
+      .filter(h => h.estado === 'abierto' && !h.oculto)
       .map(h => ({ ...h, visita: vmap[h.visitaId] }))
       .sort((a, b) => (peso[a.severidad] ?? 3) - (peso[b.severidad] ?? 3) || a.creado - b.creado);
   },

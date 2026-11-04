@@ -257,3 +257,17 @@ input[type="url"], input[type="password"] { width: 100%; min-height: 46px; paddi
 #deshacer button { border: 0; background: none; color: #7CC4F0; font-weight: 700; font-size: 16px; height: 44px; padding: 0 14px; }
 .pill:has(.punto.ok) { background: var(--ok-fondo); }
 .pill:has(.punto.err) { background: var(--urgente-fondo); }
+
+.btn-ocultar { width: 44px; height: 44px; border: 1px solid var(--borde); border-radius: 12px; background: var(--tarjeta); color: var(--gris-txt); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+.btn-ocultar svg { width: 22px; height: 22px; }
+.btn-ocultar.chico { width: 34px; height: 34px; border-radius: 10px; }
+.btn-ocultar.chico svg { width: 18px; height: 18px; }
+.btn-ocultar:active { transform: scale(0.94); }
+.fila-botones { display: flex; gap: 6px; }
+.col-botones { display: flex; flex-direction: column; gap: 8px; flex-shrink: 0; }
+.fila-visita { flex-direction: row; align-items: flex-start; gap: 12px; }
+.enlace-visita { color: var(--texto); }
+.fila-visita.oculta, .inf-fila.oculta { opacity: 0.6; }
+.rojo-txt { color: var(--rojo-txt); }
+.detalles { display: block; }
+.detalles[open] summary { margin-bottom: 8px; }

@@ -519,7 +519,7 @@ async function vistaPendientes(id) {
           <div class="badges">${badgeSeveridad(h.severidad)}${badgeCategoria(h.categoria)}</div>
           ${h.visita ? `<div class="sec peq">Visita del ${fmt.fechaCorta(h.visita.inicio)}${h.responsable ? ` · ${esc(h.responsable)}` : ''}</div>` : ''}
         </div>
-        ${botonBorrar(h)}
+        <div class="col-botones">${botonOcultar(h)}${botonBorrar(h)}</div>
       </div>
       <div class="dos">
         <button class="btn ${resuelto ? 'btn-ok-activo' : 'btn-sec'}" data-accion="resuelto" data-id="${h.id}" data-visita="${visita.id}">Resuelto</button>
@@ -828,7 +828,9 @@ async function vistaInforme(id) {
   if (!visita) return vistaInicio();
   const local = await db.uno('locales', visita.localId);
   const url = visita.pdfId ? await urlBlob(visita.pdfId) : null;
-  const nuevos = await db.hallazgosDeVisita(visita.id);
+  const todosNuevos = await db.hallazgosDeVisita(visita.id);
+  const nuevos = todosNuevos.filter(h => !h.oculto);
+  const ocultos = todosNuevos.filter(h => h.oculto);
   const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
   const vmap = Object.fromEntries((await db.todos('visitas')).map(v => [v.id, v]));
   const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
@@ -844,7 +846,12 @@ async function vistaInforme(id) {
         ${h.transcripcion ? `<div class="sec peq">“${esc(h.transcripcion)}”</div>` : ''}
         ${h.fotoId ? `<div class="foto-thumb inf-foto" data-foto="${h.fotoId}">${ICONO.camara}</div>` : ''}
       </div>
-      <div class="inf-acciones">${badgeSeveridad(h.severidad)}${botonBorrar(h, true)}</div>
+      <div class="inf-acciones">${badgeSeveridad(h.severidad)}<div class="fila-botones">${botonOcultar(h, true)}${botonBorrar(h, true)}</div></div>
+    </div>`;
+  const filaOculta = h => `
+    <div class="inf-fila oculta">
+      <div class="col"><div class="t15">${esc(tituloHallazgo(h))}</div><div class="sec peq">Oculto: no aparece en el informe ni en pendientes</div></div>
+      <div class="fila-botones">${botonOcultar(h, true)}${botonBorrar(h, true)}</div>
     </div>`;
   const filaPend = (h, estadoTxt, clase) => {
     const v = vmap[h.visitaId];
@@ -868,11 +875,16 @@ async function vistaInforme(id) {
           ? resueltos.map(h => filaPend(h, 'Resuelto', 'badge-ok')).join('') + siguenAbiertos.map(h => filaPend(h, 'Sigue abierto', 'badge-urgente')).join('')
           : '<p class="sec peq">No había pendientes.</p>'}
       </div>
+      ${ocultos.length ? `<details class="card detalles"><summary class="t16">${ocultos.length} ${ocultos.length === 1 ? 'hallazgo oculto' : 'hallazgos ocultos'}</summary>${ocultos.map(filaOculta).join('')}</details>` : ''}
       <div class="dos">
         ${url ? `<a class="btn btn-sec" href="${url}" target="_blank" rel="noopener">${ICONO.doc}<span>Ver PDF</span></a>` : ''}
         <button class="btn btn-sec" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar</button>
       </div>
       <a class="btn btn-texto" href="#/revision/${visita.id}">Corregir hallazgos</a>
+      <div class="dos">
+        <button class="btn btn-sec" data-accion="${visita.oculta ? 'mostrar-visita' : 'ocultar-visita'}" data-id="${visita.id}">${visita.oculta ? ICONO_OJO : ICONO_OJO_TACHADO}<span>${visita.oculta ? 'Mostrar visita' : 'Ocultar visita'}</span></button>
+        <button class="btn btn-sec rojo-txt" data-accion="borrar-visita" data-id="${visita.id}">${ICONO.basura}<span>Borrar visita</span></button>
+      </div>
     </div>
     <div class="pie-fijo dos">
       <button class="btn btn-sec" data-accion="compartir-word" data-id="${visita.id}">${ICONO.doc}<span>Word</span></button>
@@ -968,7 +980,7 @@ function ofrecerCompartir(archivo) {
 
 async function datosInforme(visita) {
   const local = await db.uno('locales', visita.localId);
-  const nuevos = await db.hallazgosDeVisita(visita.id);
+  const nuevos = (await db.hallazgosDeVisita(visita.id)).filter(h => !h.oculto);
   const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
   const vmap = Object.fromEntries((await db.todos('visitas')).map(v => [v.id, v]));
   resueltos.forEach(h => { h.visita = vmap[h.visitaId]; });
@@ -1027,21 +1039,71 @@ async function refrescarTrasCambio(h) {
   render();
 }
 
-function mostrarDeshacer(texto) {
+let accionDeshacer = null;
+let timerDeshacer = null;
+function mostrarDeshacer(texto, accion = deshacerBorrado) {
   let barra = document.getElementById('deshacer');
   if (!barra) {
     barra = document.createElement('div');
     barra.id = 'deshacer';
     barra.innerHTML = '<span class="txt"></span><button type="button">Deshacer</button>';
-    barra.querySelector('button').addEventListener('click', deshacerBorrado);
+    barra.querySelector('button').addEventListener('click', () => { const a = accionDeshacer; accionDeshacer = null; if (a) a(); });
     document.body.appendChild(barra);
   }
+  accionDeshacer = accion;
   barra.querySelector('.txt').textContent = texto;
   barra.classList.add('visible');
+  clearTimeout(timerDeshacer);
+  timerDeshacer = setTimeout(ocultarDeshacer, 6000);
 }
 function ocultarDeshacer() {
   const barra = document.getElementById('deshacer');
   if (barra) barra.classList.remove('visible');
+}
+
+const ICONO_OJO_TACHADO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c5 0 9 4.5 10 7-.4 1-1.2 2.3-2.4 3.5M6.6 6.6C4.3 8 2.7 10.2 2 12c1 2.5 5 7 10 7 1.9 0 3.6-.6 5.1-1.5"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>';
+const ICONO_OJO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12c1-2.5 5-7 10-7s9 4.5 10 7c-1 2.5-5 7-10 7S3 14.5 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+
+function botonOcultar(h, chico = false) {
+  return h.oculto
+    ? `<button class="btn-ocultar${chico ? ' chico' : ''}" data-accion="mostrar-hallazgo" data-id="${h.id}" aria-label="Volver a mostrar">${ICONO_OJO}</button>`
+    : `<button class="btn-ocultar${chico ? ' chico' : ''}" data-accion="ocultar-hallazgo" data-id="${h.id}" aria-label="Ocultar hallazgo">${ICONO_OJO_TACHADO}</button>`;
+}
+
+async function cambiarOculto(h, oculto) {
+  h.oculto = oculto;
+  await db.guardar('hallazgos', h);
+  await refrescarTrasCambio(h);
+  if (oculto) {
+    if (ultimoBorrado) { clearTimeout(ultimoBorrado.timer); ultimoBorrado = null; }
+    ultimoOcultado = h.id;
+    mostrarDeshacer(`Hallazgo oculto: ${tituloHallazgo(h).slice(0, 40)}`, async () => {
+      const x = await db.uno('hallazgos', ultimoOcultado);
+      ocultarDeshacer();
+      if (x) await cambiarOculto(x, false);
+    });
+  }
+}
+let ultimoOcultado = null;
+
+async function cambiarVisitaOculta(id, oculta) {
+  const v = await db.uno('visitas', id);
+  if (!v) return;
+  v.oculta = oculta;
+  await db.guardar('visitas', v);
+  render();
+  if (oculta) mostrarDeshacer('Visita oculta del historial', async () => { ocultarDeshacer(); await cambiarVisitaOculta(id, false); });
+}
+
+async function borrarVisita(id) {
+  const v = await db.uno('visitas', id);
+  if (!v) return;
+  const local = await db.uno('locales', v.localId);
+  const hs = await db.hallazgosDeVisita(id);
+  if (!confirm(`¿Borrar la visita a ${local ? local.nombre : 'este local'} del ${fmt.fechaCorta(v.inicio)} con sus ${hs.length} hallazgos, audios, fotos e informe? No se puede deshacer.`)) return;
+  await db.borrarVisitaCompleta(v);
+  toast('Visita borrada');
+  if (estado.vista === 'informe') ir('historial'); else render();
 }
 
 function botonBorrar(h, chico = false) {
@@ -1059,8 +1121,11 @@ function descargar(blob, nombre) {
 // ---- Historial
 
 let filtroLocal = null;
+let verVisitasOcultas = false;
 async function vistaHistorial() {
-  const visitas = (await db.todos('visitas')).filter(v => v.estado === 'confirmada').sort((a, b) => b.inicio - a.inicio);
+  const todas = (await db.todos('visitas')).filter(v => v.estado === 'confirmada').sort((a, b) => b.inicio - a.inicio);
+  const cantOcultas = todas.filter(v => v.oculta).length;
+  const visitas = todas.filter(v => verVisitasOcultas ? v.oculta : !v.oculta);
   const locales = (await db.todos('locales')).sort((a, b) => a.nombre.localeCompare(b.nombre));
   const lmap = Object.fromEntries(locales.map(l => [l.id, l]));
   const filtradas = filtroLocal ? visitas.filter(v => v.localId === filtroLocal) : visitas;
@@ -1074,19 +1139,24 @@ async function vistaHistorial() {
   for (const [mes, lista] of grupos) {
     filas.push(`<div class="etiqueta">${esc(mes)}</div>`);
     for (const v of lista) {
-      const hs = await db.hallazgosDeVisita(v.id);
+      const hs = (await db.hallazgosDeVisita(v.id)).filter(h => !h.oculto);
       const abiertos = hs.filter(h => h.estado === 'abierto').length;
       const conteo = {};
       hs.forEach(h => { if (h.severidad) conteo[h.severidad] = (conteo[h.severidad] || 0) + 1; });
       filas.push(`
-        <a class="card fila-visita" href="#/informe/${v.id}">
-          <div class="col">
+        <div class="card fila-visita${v.oculta ? ' oculta' : ''}">
+          <a class="col enlace-visita" href="#/informe/${v.id}">
             <div class="t16">${esc(lmap[v.localId] ? lmap[v.localId].nombre : '')}</div>
             <div class="sec peq">${fmt.fechaCorta(v.inicio)} · ${hs.length} hallazgos · ${abiertos ? `${abiertos} pendientes abiertos` : 'sin pendientes'}</div>
             <div class="badges">${SEVERIDADES.map(s => conteo[s.id] ? `<span class="badge badge-${s.id}">${conteo[s.id]} ${s.titulo.toLowerCase()}${conteo[s.id] > 1 && s.id !== 'leve' ? 's' : ''}</span>` : '').join('')}</div>
+          </a>
+          <div class="col-botones">
+            ${v.oculta
+              ? `<button class="btn-ocultar" data-accion="mostrar-visita" data-id="${v.id}" aria-label="Volver a mostrar la visita">${ICONO_OJO}</button>`
+              : `<button class="btn-ocultar" data-accion="ocultar-visita" data-id="${v.id}" aria-label="Ocultar la visita">${ICONO_OJO_TACHADO}</button>`}
+            <button class="btn-borrar" data-accion="borrar-visita" data-id="${v.id}" aria-label="Borrar la visita">${ICONO.basura}</button>
           </div>
-          <span class="icono acento">${ICONO.doc}</span>
-        </a>`);
+        </div>`);
     }
   }
   return `
@@ -1096,7 +1166,10 @@ async function vistaHistorial() {
         <button class="chip ${filtroLocal ? '' : 'activo'}" data-accion="filtro-local" data-valor="">Todos</button>
         ${locales.map(l => `<button class="chip ${filtroLocal === l.id ? 'activo' : ''}" data-accion="filtro-local" data-valor="${l.id}">${esc(l.nombre)}</button>`).join('')}
       </div>
-      ${filas.length ? filas.join('') : '<p class="sec centrado">Las visitas confirmadas aparecen acá.</p>'}
+      ${verVisitasOcultas ? '<p class="sec peq">Visitas ocultas: no aparecen en el historial y sus hallazgos no se arrastran como pendientes. Tocá el ojo para volver a mostrarlas.</p>' : ''}
+      ${filas.length ? filas.join('') : `<p class="sec centrado">${verVisitasOcultas ? 'No hay visitas ocultas.' : 'Las visitas confirmadas aparecen acá.'}</p>`}
+      ${cantOcultas || verVisitasOcultas ? `<button class="btn btn-texto" data-accion="ver-ocultas">${verVisitasOcultas ? 'Volver al historial' : `Ver visitas ocultas (${cantOcultas})`}</button>` : ''}
+      <p class="sec peq centrado">Ojo: ocultar (se puede volver a mostrar). Basurita: borrar para siempre.</p>
     </div>`;
 }
 
@@ -1365,6 +1438,12 @@ app.addEventListener('click', async e => {
       break;
     }
     case 'cerrar-visita': cerrarVisita(id); break;
+    case 'ocultar-hallazgo': { const h = await db.uno('hallazgos', id); if (h) await cambiarOculto(h, true); break; }
+    case 'mostrar-hallazgo': { const h = await db.uno('hallazgos', id); if (h) { await cambiarOculto(h, false); toast('Hallazgo visible de nuevo'); } break; }
+    case 'ocultar-visita': cambiarVisitaOculta(id, true); break;
+    case 'mostrar-visita': cambiarVisitaOculta(id, false); toast('Visita visible de nuevo'); break;
+    case 'borrar-visita': borrarVisita(id); break;
+    case 'ver-ocultas': verVisitasOcultas = !verVisitasOcultas; render(); break;
     case 'borrar-hallazgo': {
       const h = await db.uno('hallazgos', id);
       if (h) await borrarConDeshacer(h);
