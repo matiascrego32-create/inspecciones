@@ -506,7 +506,7 @@ async function vistaPendientes(id) {
   if (!visita) return vistaInicio();
   const local = await db.uno('locales', visita.localId);
   const abiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
-  const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
+  const resueltos = (await db.hallazgosResueltosEnVisita(visita.id)).filter(h => !h.oculto);
   const total = abiertos.length + resueltos.length;
   const verificados = resueltos.length + abiertos.filter(h => estado.siguenPendientes.has(h.id)).length;
 
@@ -831,7 +831,7 @@ async function vistaInforme(id) {
   const todosNuevos = await db.hallazgosDeVisita(visita.id);
   const nuevos = todosNuevos.filter(h => !h.oculto);
   const ocultos = todosNuevos.filter(h => h.oculto);
-  const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
+  const resueltos = (await db.hallazgosResueltosEnVisita(visita.id)).filter(h => !h.oculto);
   const vmap = Object.fromEntries((await db.todos('visitas')).map(v => [v.id, v]));
   const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
   const fechaLarga = new Date(visita.inicio).toLocaleDateString('es-UY', { day: 'numeric', month: 'long', year: 'numeric' });
@@ -855,7 +855,7 @@ async function vistaInforme(id) {
     </div>`;
   const filaPend = (h, estadoTxt, clase) => {
     const v = vmap[h.visitaId];
-    return `<div class="inf-fila"><div class="col"><div class="t15">${esc(tituloHallazgo(h))}</div>${v ? `<div class="sec peq">Visita del ${fmt.fechaCorta(v.inicio)}${h.responsable ? ` · ${esc(h.responsable)}` : ''}</div>` : ''}</div><span class="badge ${clase}">${estadoTxt}</span></div>`;
+    return `<div class="inf-fila"><div class="col"><div class="t15">${esc(tituloHallazgo(h))}</div>${v ? `<div class="sec peq">Visita del ${fmt.fechaCorta(v.inicio)}${h.responsable ? ` · ${esc(h.responsable)}` : ''}</div>` : ''}</div><div class="inf-acciones"><span class="badge ${clase}">${estadoTxt}</span><div class="fila-botones">${botonOcultar(h, true)}${botonBorrar(h, true)}</div></div></div>`;
   };
 
   return `
@@ -881,10 +881,6 @@ async function vistaInforme(id) {
         <button class="btn btn-sec" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar</button>
       </div>
       <a class="btn btn-texto" href="#/revision/${visita.id}">Corregir hallazgos</a>
-      <div class="dos">
-        <button class="btn btn-sec" data-accion="${visita.oculta ? 'mostrar-visita' : 'ocultar-visita'}" data-id="${visita.id}">${visita.oculta ? ICONO_OJO : ICONO_OJO_TACHADO}<span>${visita.oculta ? 'Mostrar visita' : 'Ocultar visita'}</span></button>
-        <button class="btn btn-sec rojo-txt" data-accion="borrar-visita" data-id="${visita.id}">${ICONO.basura}<span>Borrar visita</span></button>
-      </div>
     </div>
     <div class="pie-fijo dos">
       <button class="btn btn-sec" data-accion="compartir-word" data-id="${visita.id}">${ICONO.doc}<span>Word</span></button>
@@ -981,7 +977,7 @@ function ofrecerCompartir(archivo) {
 async function datosInforme(visita) {
   const local = await db.uno('locales', visita.localId);
   const nuevos = (await db.hallazgosDeVisita(visita.id)).filter(h => !h.oculto);
-  const resueltos = await db.hallazgosResueltosEnVisita(visita.id);
+  const resueltos = (await db.hallazgosResueltosEnVisita(visita.id)).filter(h => !h.oculto);
   const vmap = Object.fromEntries((await db.todos('visitas')).map(v => [v.id, v]));
   resueltos.forEach(h => { h.visita = vmap[h.visitaId]; });
   const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
