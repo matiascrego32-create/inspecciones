@@ -519,6 +519,7 @@ async function vistaPendientes(id) {
           <div class="badges">${badgeSeveridad(h.severidad)}${badgeCategoria(h.categoria)}</div>
           ${h.visita ? `<div class="sec peq">Visita del ${fmt.fechaCorta(h.visita.inicio)}${h.responsable ? ` · ${esc(h.responsable)}` : ''}</div>` : ''}
         </div>
+        ${botonBorrar(h)}
       </div>
       <div class="dos">
         <button class="btn ${resuelto ? 'btn-ok-activo' : 'btn-sec'}" data-accion="resuelto" data-id="${h.id}" data-visita="${visita.id}">Resuelto</button>
@@ -604,7 +605,7 @@ function filaGrabado(h) {
       </div>
       ${h.estadoProceso === 'error'
         ? `<button class="btn btn-sec chico" data-accion="reintentar" data-id="${h.id}">Reintentar</button>`
-        : `<button class="btn-icono rojo" data-accion="borrar-hallazgo" data-id="${h.id}" aria-label="Borrar hallazgo ${h.orden}">${ICONO.basura}</button>`}
+        : botonBorrar(h)}
     </div>`;
 }
 vistaGrabacion.montar = async () => {
@@ -741,7 +742,7 @@ function tarjetaRevision(h) {
     <div class="card tarjeta-rev" data-hid="${h.id}">
       <div class="entre">
         <span class="sec peq">Hallazgo ${h.orden}${h.audioId ? ` · ${fmt.duracion(h.duracion)}` : ' · manual'}</span>
-        <button class="btn-icono rojo" data-accion="borrar-hallazgo" data-id="${h.id}" aria-label="Borrar hallazgo">${ICONO.basura}</button>
+        ${botonBorrar(h)}
       </div>
       <label class="campo">
         <span class="etiqueta-campo">Descripción</span>
@@ -843,7 +844,7 @@ async function vistaInforme(id) {
         ${h.transcripcion ? `<div class="sec peq">“${esc(h.transcripcion)}”</div>` : ''}
         ${h.fotoId ? `<div class="foto-thumb inf-foto" data-foto="${h.fotoId}">${ICONO.camara}</div>` : ''}
       </div>
-      ${badgeSeveridad(h.severidad)}
+      <div class="inf-acciones">${badgeSeveridad(h.severidad)}${botonBorrar(h, true)}</div>
     </div>`;
   const filaPend = (h, estadoTxt, clase) => {
     const v = vmap[h.visitaId];
@@ -973,6 +974,78 @@ async function datosInforme(visita) {
   resueltos.forEach(h => { h.visita = vmap[h.visitaId]; });
   const siguenAbiertos = (await db.hallazgosAbiertosDeLocal(visita.localId)).filter(h => h.visitaId !== visita.id);
   return { visita, local, nuevos, resueltos, siguenAbiertos, blobDe: id => db.blob(id) };
+}
+
+// ---- Borrar hallazgos al toque, con "Deshacer"
+
+let ultimoBorrado = null;   // { hallazgo, blobs: [registros], timer }
+
+async function borrarConDeshacer(h) {
+  // Guarda una copia completa (registro + audio + foto) antes de borrar.
+  const blobs = [];
+  for (const bid of [h.audioId, h.fotoId]) {
+    if (!bid) continue;
+    const r = await db.uno('blobs', bid);
+    if (r) blobs.push(r);
+  }
+  // Un borrado anterior que ya no se puede deshacer queda definitivo.
+  if (ultimoBorrado) clearTimeout(ultimoBorrado.timer);
+  ultimoBorrado = { hallazgo: { ...h }, blobs };
+  // Si estaba marcado como resuelto en otra visita, no hace falta tocar nada más: se borra y listo.
+  await db.borrarHallazgoCompleto(h);
+  await refrescarTrasCambio(h);
+  mostrarDeshacer(`Hallazgo borrado: ${tituloHallazgo(h).slice(0, 40)}`);
+  ultimoBorrado.timer = setTimeout(() => { ultimoBorrado = null; ocultarDeshacer(); }, 6000);
+}
+
+async function deshacerBorrado() {
+  const b = ultimoBorrado;
+  if (!b) return;
+  clearTimeout(b.timer);
+  ultimoBorrado = null;
+  ocultarDeshacer();
+  for (const r of b.blobs) await db.guardar('blobs', r);
+  const { visita, ...registro } = b.hallazgo; // "visita" puede venir agregado en memoria; no se guarda
+  await db.guardar('hallazgos', registro);
+  await refrescarTrasCambio(registro);
+  toast('Hallazgo recuperado');
+  if (registro.estadoProceso === 'grabado' || registro.estadoProceso === 'transcribiendo') {
+    registro.estadoProceso = 'grabado';
+    await db.guardar('hallazgos', registro);
+    procesarPendientes();
+  }
+}
+
+/** Vuelve a dibujar lo que corresponda después de borrar o recuperar un hallazgo. */
+async function refrescarTrasCambio(h) {
+  if (estado.vista === 'grabacion') { refrescarListaGrabados(); return; }
+  if (estado.vista === 'informe') {
+    // El PDF y el Word tienen que reflejar el cambio.
+    const v = await db.uno('visitas', rutaActual().param);
+    if (v && v.estado === 'confirmada') { try { await regenerarPDF(v); } catch (_) {} }
+  }
+  render();
+}
+
+function mostrarDeshacer(texto) {
+  let barra = document.getElementById('deshacer');
+  if (!barra) {
+    barra = document.createElement('div');
+    barra.id = 'deshacer';
+    barra.innerHTML = '<span class="txt"></span><button type="button">Deshacer</button>';
+    barra.querySelector('button').addEventListener('click', deshacerBorrado);
+    document.body.appendChild(barra);
+  }
+  barra.querySelector('.txt').textContent = texto;
+  barra.classList.add('visible');
+}
+function ocultarDeshacer() {
+  const barra = document.getElementById('deshacer');
+  if (barra) barra.classList.remove('visible');
+}
+
+function botonBorrar(h, chico = false) {
+  return `<button class="btn-borrar${chico ? ' chico' : ''}" data-accion="borrar-hallazgo" data-id="${h.id}" aria-label="Borrar hallazgo">${ICONO.basura}</button>`;
 }
 
 function descargar(blob, nombre) {
@@ -1293,10 +1366,8 @@ app.addEventListener('click', async e => {
     }
     case 'cerrar-visita': cerrarVisita(id); break;
     case 'borrar-hallazgo': {
-      if (!confirm('¿Borrar este hallazgo?')) return;
       const h = await db.uno('hallazgos', id);
-      if (h) await db.borrarHallazgoCompleto(h);
-      if (estado.vista === 'grabacion') refrescarListaGrabados(); else render();
+      if (h) await borrarConDeshacer(h);
       break;
     }
     case 'reintentar': { const h = await db.uno('hallazgos', id); if (h) reintentar(h); break; }
