@@ -8,7 +8,7 @@ import { clasificar, resumir, CATEGORIAS, SEVERIDADES, RESPONSABLES_POR_DEFECTO,
 import { generarWord } from './word.js';
 import { generarInforme } from './pdf.js';
 
-export const VERSION_APP = '10 (4 nov 2026)';
+export const VERSION_APP = '11 (4 nov 2026)';
 const app = document.getElementById('app');
 const UMBRAL_METROS = 200;
 
@@ -877,10 +877,15 @@ async function vistaInforme(id) {
           : '<p class="sec peq">No había pendientes.</p>'}
       </div>
       ${ocultos.length ? `<details class="card detalles"><summary class="t16">${ocultos.length} ${ocultos.length === 1 ? 'hallazgo oculto' : 'hallazgos ocultos'}</summary>${ocultos.map(filaOculta).join('')}</details>` : ''}
-      <div class="dos">
-        ${url ? `<a class="btn btn-sec" href="${url}" target="_blank" rel="noopener">${ICONO.doc}<span>Ver PDF</span></a>` : ''}
-        <button class="btn btn-sec" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar</button>
+      <div class="card">
+        <div class="t16">Abrir el archivo</div>
+        <p class="sec peq">Abre el informe en el visor del iPhone. Desde ahí, con el botón de compartir, se envía por WhatsApp o mail. Si al compartir directo el mensaje queda en "no se pudo enviar", usá este camino.</p>
+        <div class="dos">
+          <button class="btn btn-sec" data-accion="abrir-pdf" data-id="${visita.id}">${ICONO.doc}<span>Abrir PDF</span></button>
+          <button class="btn btn-sec" data-accion="abrir-word" data-id="${visita.id}">${ICONO.doc}<span>Abrir Word</span></button>
+        </div>
       </div>
+      <button class="btn btn-texto" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar el informe</button>
       <a class="btn btn-texto" href="#/revision/${visita.id}">Corregir hallazgos</a>
     </div>
     <div class="pie-fijo dos">
@@ -907,11 +912,13 @@ async function prepararArchivos(visitaId) {
     const datos = await datosInforme(visita);
     const pdfBlob = await db.blob(visita.pdfId);
     if (archivosListos.visitaId !== visitaId) return;
-    if (pdfBlob) archivosListos.pdf = new File([pdfBlob], nombreArchivo(datos.local, visita, 'pdf'), { type: 'application/pdf' });
+    // Copia completa en memoria (no una referencia al archivo guardado): en algunos iPhone, WhatsApp pierde
+    // el acceso a la referencia antes de terminar de subirla y el mensaje queda "no se pudo enviar".
+    if (pdfBlob) archivosListos.pdf = new File([await pdfBlob.arrayBuffer()], nombreArchivo(datos.local, visita, 'pdf'), { type: 'application/pdf' });
     try {
       const wordBlob = await generarWord(datos);
       if (archivosListos.visitaId !== visitaId) return;
-      archivosListos.word = new File([wordBlob], nombreArchivo(datos.local, visita, 'docx'), { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+      archivosListos.word = new File([await wordBlob.arrayBuffer()], nombreArchivo(datos.local, visita, 'docx'), { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
     } catch (e) {
       console.warn('Word', e);
     }
@@ -923,6 +930,8 @@ async function prepararArchivos(visitaId) {
 
 function marcarBotonesListos() {
   for (const tipo of ['pdf', 'word']) {
+    const abrir = app.querySelector(`[data-accion="abrir-${tipo}"]`);
+    if (abrir) abrir.disabled = !archivosListos[tipo];
     const b = app.querySelector(`[data-accion="compartir-${tipo}"]`);
     if (!b) continue;
     const listo = !!archivosListos[tipo];
@@ -1105,6 +1114,21 @@ async function borrarVisita(id) {
 
 function botonBorrar(h, chico = false) {
   return `<button class="btn-borrar${chico ? ' chico' : ''}" data-accion="borrar-hallazgo" data-id="${h.id}" aria-label="Borrar hallazgo">${ICONO.basura}</button>`;
+}
+
+/** Abre el archivo en el visor del sistema (en iPhone: vista previa con botón de compartir). */
+function abrirArchivo(archivo) {
+  const url = URL.createObjectURL(archivo);
+  const enApp = window.matchMedia('(display-mode: standalone)').matches || navigator.standalone;
+  if (archivo.type === 'application/pdf' && !enApp) {
+    // En Safari común, el PDF se abre en una pestaña con su propio botón de compartir.
+    const w = window.open(url, '_blank');
+    if (!w) descargar(archivo, archivo.name);
+  } else {
+    // Desde la app en la pantalla de inicio, o para el Word: iOS lo ofrece como descarga y lo abre en la vista previa.
+    descargar(archivo, archivo.name);
+  }
+  setTimeout(() => URL.revokeObjectURL(url), 120000);
 }
 
 function descargar(blob, nombre) {
@@ -1514,6 +1538,13 @@ app.addEventListener('click', async e => {
       break;
     }
     case 'compartir-word': compartirArchivo('word', id); break;
+    case 'abrir-pdf': case 'abrir-word': {
+      const tipo = a === 'abrir-pdf' ? 'pdf' : 'word';
+      const archivo = archivosListos.visitaId === id ? archivosListos[tipo] : null;
+      if (!archivo) { toast('El archivo todavía se está preparando. Probá de nuevo en un segundo.'); break; }
+      abrirArchivo(archivo);
+      break;
+    }
     case 'agregar-manual': agregarManual(el.dataset.visita); break;
     case 'confirmar-visita': confirmarVisita(id); break;
     case 'regenerar-pdf': {
