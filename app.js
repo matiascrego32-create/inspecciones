@@ -8,7 +8,7 @@ import { clasificar, resumir, CATEGORIAS, SEVERIDADES, RESPONSABLES_POR_DEFECTO,
 import { generarWord } from './word.js';
 import { generarInforme } from './pdf.js';
 
-export const VERSION_APP = '11 (4 nov 2026)';
+export const VERSION_APP = '12 (5 nov 2026)';
 const app = document.getElementById('app');
 const UMBRAL_METROS = 200;
 
@@ -912,13 +912,11 @@ async function prepararArchivos(visitaId) {
     const datos = await datosInforme(visita);
     const pdfBlob = await db.blob(visita.pdfId);
     if (archivosListos.visitaId !== visitaId) return;
-    // Copia completa en memoria (no una referencia al archivo guardado): en algunos iPhone, WhatsApp pierde
-    // el acceso a la referencia antes de terminar de subirla y el mensaje queda "no se pudo enviar".
-    if (pdfBlob) archivosListos.pdf = new File([await pdfBlob.arrayBuffer()], nombreArchivo(datos.local, visita, 'pdf'), { type: 'application/pdf' });
+    if (pdfBlob) archivosListos.pdf = new File([pdfBlob], nombreArchivo(datos.local, visita, 'pdf'), { type: 'application/pdf' });
     try {
       const wordBlob = await generarWord(datos);
       if (archivosListos.visitaId !== visitaId) return;
-      archivosListos.word = new File([await wordBlob.arrayBuffer()], nombreArchivo(datos.local, visita, 'docx'), { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+      archivosListos.word = new File([wordBlob], nombreArchivo(datos.local, visita, 'docx'), { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
     } catch (e) {
       console.warn('Word', e);
     }
@@ -951,9 +949,9 @@ vistaInforme.montar = async id => {
 function compartirArchivo(tipo, id) {
   const archivo = archivosListos.visitaId === id ? archivosListos[tipo] : null;
   if (!archivo) { toast('El archivo todavía se está preparando. Probá de nuevo en un segundo.'); return; }
-  // Solo el archivo, sin título ni texto: con texto, WhatsApp en iPhone a veces manda solo el texto.
+  // Igual que la primera versión (la que le funcionaba al iPhone con iOS 27): el archivo con su nombre como título.
   if (navigator.share && (!navigator.canShare || navigator.canShare({ files: [archivo] }))) {
-    navigator.share({ files: [archivo] }).catch(e => {
+    navigator.share({ files: [archivo], title: archivo.name }).catch(e => {
       if (e && e.name === 'AbortError') return;
       if (e && e.name === 'NotAllowedError') { ofrecerCompartir(archivo); return; }
       descargar(archivo, archivo.name);
@@ -976,7 +974,7 @@ function ofrecerCompartir(archivo) {
   document.body.appendChild(hoja);
   hoja.addEventListener('click', e => {
     if (e.target.closest('[data-compartir]')) {
-      navigator.share({ files: [archivo] }).then(() => hoja.remove()).catch(err => { if (err && err.name !== 'AbortError') descargar(archivo, archivo.name); });
+      navigator.share({ files: [archivo], title: archivo.name }).then(() => hoja.remove()).catch(err => { if (err && err.name !== 'AbortError') descargar(archivo, archivo.name); });
       return;
     }
     if (e.target.closest('[data-guardar]')) { descargar(archivo, archivo.name); hoja.remove(); return; }
