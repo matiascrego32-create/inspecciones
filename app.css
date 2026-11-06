@@ -271,3 +271,8 @@ input[type="url"], input[type="password"] { width: 100%; min-height: 46px; paddi
 .rojo-txt { color: var(--rojo-txt); }
 .detalles { display: block; }
 .detalles[open] summary { margin-bottom: 8px; }
+
+.pie-fijo.tres { flex-direction: row; }
+.pie-fijo.tres > .btn { flex: 1; padding: 0 8px; font-size: 15px; }
+.btn-wa { background: #25D366; border-color: #25D366; color: #06331A; }
+.btn-wa.apagado { opacity: 0.6; }

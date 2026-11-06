@@ -102,3 +102,32 @@ export function wavDePrueba() {
   for (let i = 0; i < muestras; i++) v.setInt16(44 + i * 2, Math.round(Math.sin(i / 20) * 300), true);
   return new Blob([buf], { type: 'audio/wav' });
 }
+
+/**
+ * Sube un informe (PDF o Word) al intermediario y devuelve el enlace público para mandarlo por WhatsApp.
+ * @returns {Promise<{url: string, vence: number}>}
+ */
+export async function subirInforme({ archivo, url, codigo }) {
+  if (!url) throw new ErrorTranscripcion('config', 'Falta configurar la dirección del servicio en Ajustes.');
+  if (navigator.onLine === false) throw new ErrorTranscripcion('red', 'Sin conexión.');
+  const destino = new URL('/informes', url).toString();
+  const headers = { 'Content-Type': archivo.type, 'X-Nombre': encodeURIComponent(archivo.name) };
+  if (codigo) headers['X-App-Code'] = codigo;
+  let resp;
+  try {
+    resp = await fetch(destino, { method: 'POST', headers, body: archivo });
+  } catch (_) {
+    throw new ErrorTranscripcion('red', 'No se pudo conectar con el servicio para subir el informe.');
+  }
+  let datos = null;
+  try { datos = await resp.json(); } catch (_) {}
+  if (!resp.ok) {
+    const msg = (datos && datos.error && datos.error.message) || `Error ${resp.status}`;
+    const e = new ErrorTranscripcion(resp.status === 501 ? 'sin_almacenamiento' : resp.status === 401 || resp.status === 403 ? 'clave' : 'otro', msg);
+    // Un Worker viejo (sin la parte de informes) intenta mandar el PDF a Groq y responde con error de formato.
+    if (resp.status === 400 || resp.status === 415 && !(datos && datos.error && /PDF y Word/.test(datos.error.message))) e.tipo = 'worker_viejo';
+    throw e;
+  }
+  if (!datos || !datos.url) throw new ErrorTranscripcion('worker_viejo', 'El intermediario no devolvió un enlace: hay que actualizar su código.');
+  return datos;
+}
