@@ -48,28 +48,6 @@ audios quedan en cola y se transcriben solos cuando vuelve la conexión.
 Para el iPhone del jefe: mismos tres pasos, con la misma dirección y el mismo código. No hace falta que
 él tenga cuenta de nada.
 
-## Enviar el informe por WhatsApp como enlace (5 minutos, gratis, una sola vez)
-
-El botón verde **WhatsApp** del informe abre WhatsApp con un mensaje listo que trae dos enlaces: uno al PDF y
-otro al Word. Quien lo recibe toca el enlace y se le abre el informe. Funciona en cualquier teléfono, incluso
-donde mandar el archivo directo queda en "no se pudo enviar", porque WhatsApp manda un mensaje de texto.
-
-Para eso el intermediario de Cloudflare necesita un lugar donde guardar los informes:
-
-1. En [dash.cloudflare.com](https://dash.cloudflare.com), menú izquierdo **Storage & Databases** → **KV**
-   (o "Workers KV") → **Create** → nombre: `informes` → **Add**.
-2. Abrí tu Worker `inspecciones` → **Edit code** → borrá todo y pegá el contenido completo, actualizado,
-   de [`proxy/cloudflare-worker.js`](proxy/cloudflare-worker.js) → **Deploy**.
-3. En el Worker → pestaña **Bindings** (o **Settings** → **Bindings**) → **Add binding** → **KV namespace** →
-   *Variable name*: `INFORMES` (en mayúsculas) → *KV namespace*: `informes` → **Add binding** / **Deploy**.
-
-Listo. Las variables que ya tenías (`GROQ_API_KEY`, `ALLOWED_ORIGINS`, `APP_CODE`) no se tocan.
-
-- Los enlaces son imposibles de adivinar y **vencen a los 90 días**. Cualquiera que tenga el enlace puede abrir
-  el informe mientras no venza, así que mandalo solo a quien corresponda.
-- El nivel gratuito de Cloudflare KV permite 1.000 informes subidos por día y 1 GB guardado: sobra.
-- Los botones **Word** y **PDF** siguen mandando el archivo directo, como siempre.
-
 ## Instalar la app en el iPhone
 
 1. Abrí la dirección de la app en **Safari** (no en Chrome).

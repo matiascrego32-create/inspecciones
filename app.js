@@ -3,12 +3,12 @@
 
 import { db, uuid, cargarLocalesSiHaceFalta } from './db.js';
 import { Grabadora } from './audio.js';
-import { transcribirRemoto, wavDePrueba, subirInforme, MODELOS_GROQ, MODELO_GROQ_POR_DEFECTO, ErrorTranscripcion } from './groq.js';
+import { transcribirRemoto, wavDePrueba, MODELOS_GROQ, MODELO_GROQ_POR_DEFECTO, ErrorTranscripcion } from './groq.js';
 import { clasificar, resumir, CATEGORIAS, SEVERIDADES, RESPONSABLES_POR_DEFECTO, sugerirResponsable } from './clasificador.js';
 import { generarWord } from './word.js';
 import { generarInforme } from './pdf.js';
 
-export const VERSION_APP = '13 (6 nov 2026)';
+export const VERSION_APP = '14 (6 nov 2026)';
 const app = document.getElementById('app');
 const UMBRAL_METROS = 200;
 
@@ -879,7 +879,7 @@ async function vistaInforme(id) {
       ${ocultos.length ? `<details class="card detalles"><summary class="t16">${ocultos.length} ${ocultos.length === 1 ? 'hallazgo oculto' : 'hallazgos ocultos'}</summary>${ocultos.map(filaOculta).join('')}</details>` : ''}
       <div class="card">
         <div class="t16">Abrir el archivo</div>
-        <p class="sec peq">Abre el informe en el visor del iPhone, para revisarlo o guardarlo en Archivos.</p>
+        <p class="sec peq">Abre el informe en el visor del iPhone. Desde ahí, con el botón de compartir, se envía por WhatsApp o mail. Si al compartir directo el mensaje queda en "no se pudo enviar", usá este camino.</p>
         <div class="dos">
           <button class="btn btn-sec" data-accion="abrir-pdf" data-id="${visita.id}">${ICONO.doc}<span>Abrir PDF</span></button>
           <button class="btn btn-sec" data-accion="abrir-word" data-id="${visita.id}">${ICONO.doc}<span>Abrir Word</span></button>
@@ -888,8 +888,7 @@ async function vistaInforme(id) {
       <button class="btn btn-texto" data-accion="regenerar-pdf" data-id="${visita.id}">Volver a generar el informe</button>
       <a class="btn btn-texto" href="#/revision/${visita.id}">Corregir hallazgos</a>
     </div>
-    <div class="pie-fijo tres">
-      <button class="btn btn-wa" data-accion="enviar-whatsapp" data-id="${visita.id}">${ICONO_WA}<span>WhatsApp</span></button>
+    <div class="pie-fijo dos">
       <button class="btn btn-sec" data-accion="compartir-word" data-id="${visita.id}">${ICONO.doc}<span>Word</span></button>
       <button class="btn btn-pri" data-accion="compartir-pdf" data-id="${visita.id}" ${url ? '' : 'disabled'}>${ICONO.compartir}<span>PDF</span></button>
     </div>`;
@@ -897,7 +896,7 @@ async function vistaInforme(id) {
 // Los archivos se preparan apenas se abre el informe. En iPhone, Safari solo abre el menú de compartir
 // si se llama en el mismo instante del toque: si antes hay que esperar a armar el archivo, lo bloquea
 // y WhatsApp nunca aparece.
-const archivosListos = { visitaId: null, pdf: null, word: null, preparando: null, enlaces: null, enlaceError: null, subiendo: false, texto: '' };
+const archivosListos = { visitaId: null, pdf: null, word: null, preparando: null };
 
 function nombreArchivo(local, visita, ext) {
   return `Inspeccion_${(local ? local.nombre : 'local').replace(/[^\wÁÉÍÓÚÑáéíóúñ-]+/g, '_')}_${new Date(visita.inicio).toISOString().slice(0, 10)}.${ext}`;
@@ -907,9 +906,6 @@ async function prepararArchivos(visitaId) {
   archivosListos.visitaId = visitaId;
   archivosListos.pdf = null;
   archivosListos.word = null;
-  archivosListos.enlaces = null;
-  archivosListos.enlaceError = null;
-  archivosListos.texto = '';
   const tarea = (async () => {
     const visita = await db.uno('visitas', visitaId);
     if (!visita) return;
@@ -924,98 +920,13 @@ async function prepararArchivos(visitaId) {
     } catch (e) {
       console.warn('Word', e);
     }
-    const fecha = new Date(visita.inicio).toLocaleDateString('es-UY', { day: 'numeric', month: 'long', year: 'numeric' });
-    archivosListos.texto = `Informe de inspección · ${datos.local ? datos.local.nombre : ''} · ${fecha}`;
   })();
   archivosListos.preparando = tarea;
   await tarea;
   marcarBotonesListos();
-  await prepararEnlaces(visitaId);
-}
-
-/** Sube el PDF y el Word al intermediario (una sola vez por versión del informe) para mandarlos como enlace. */
-async function prepararEnlaces(visitaId) {
-  const visita = await db.uno('visitas', visitaId);
-  if (!visita || archivosListos.visitaId !== visitaId) return;
-  const ahora = Date.now();
-  const firma = visita.pdfId || '';
-  if (visita.enlaces && visita.enlaces.firma === firma && visita.enlaces.vence > ahora + 24 * 3600 * 1000) {
-    archivosListos.enlaces = visita.enlaces;
-    marcarBotonesListos();
-    return;
-  }
-  const a = await ajustesServicio();
-  if (!estado.servicio.configurado) { archivosListos.enlaceError = { tipo: 'config', message: 'Falta configurar el servicio en Ajustes.' }; marcarBotonesListos(); return; }
-  archivosListos.subiendo = true;
-  marcarBotonesListos();
-  try {
-    const opciones = { url: a.servicioUrl.trim(), codigo: a.servicioCodigo.trim() };
-    const [pdf, word] = await Promise.all([
-      archivosListos.pdf ? subirInforme({ archivo: archivosListos.pdf, ...opciones }) : null,
-      archivosListos.word ? subirInforme({ archivo: archivosListos.word, ...opciones }) : null,
-    ]);
-    const enlaces = { firma, pdf: pdf && pdf.url, word: word && word.url, vence: Math.min(pdf ? pdf.vence : Infinity, word ? word.vence : Infinity) };
-    const fresca = await db.uno('visitas', visitaId);
-    if (fresca && fresca.pdfId === visita.pdfId) { fresca.enlaces = enlaces; await db.guardar('visitas', fresca); }
-    if (archivosListos.visitaId === visitaId) archivosListos.enlaces = enlaces;
-  } catch (e) {
-    if (archivosListos.visitaId === visitaId) archivosListos.enlaceError = { tipo: e.tipo || 'otro', message: e.message || String(e) };
-  } finally {
-    archivosListos.subiendo = false;
-    marcarBotonesListos();
-  }
-}
-
-function textoWhatsApp() {
-  const e = archivosListos.enlaces;
-  const lineas = [archivosListos.texto];
-  if (e.pdf) lineas.push(`PDF: ${e.pdf}`);
-  if (e.word) lineas.push(`Word (editable): ${e.word}`);
-  return lineas.join('\n');
-}
-
-/** Abre WhatsApp con el mensaje listo. Se llama directo desde el toque. */
-function enviarPorWhatsApp(id) {
-  if (archivosListos.visitaId !== id) return;
-  if (archivosListos.enlaces) {
-    const texto = encodeURIComponent(textoWhatsApp());
-    // La app de WhatsApp directamente; si no abre (no instalada), la versión web.
-    location.href = `whatsapp://send?text=${texto}`;
-    setTimeout(() => { if (document.visibilityState === 'visible') location.href = `https://wa.me/?text=${texto}`; }, 1500);
-    return;
-  }
-  if (archivosListos.subiendo || !archivosListos.pdf) { toast('Preparando el enlace del informe… Probá de nuevo en unos segundos.'); return; }
-  const err = archivosListos.enlaceError;
-  if (err && (err.tipo === 'sin_almacenamiento' || err.tipo === 'worker_viejo')) { ayudaEnlaces(); return; }
-  if (err) {
-    toast('No se pudo preparar el enlace: ' + err.message, 'error');
-    prepararEnlaces(id); // reintenta para el próximo toque
-    return;
-  }
-  prepararEnlaces(id);
-  toast('Preparando el enlace del informe… Probá de nuevo en unos segundos.');
-}
-
-function ayudaEnlaces() {
-  const hoja = document.createElement('div');
-  hoja.className = 'hoja';
-  hoja.innerHTML = `
-    <div class="hoja-panel">
-      <div class="hoja-enc"><strong>Falta un paso en Cloudflare</strong><button class="btn-texto" data-cerrar>Cerrar</button></div>
-      <p class="sec">Para mandar el informe como enlace, el intermediario necesita un lugar donde guardarlo. Es gratis y se hace una sola vez desde una computadora; los pasos están en el README del proyecto, en la sección "Enviar por WhatsApp como enlace".</p>
-      <p class="sec peq">Mientras tanto, los botones PDF y Word siguen funcionando como siempre.</p>
-    </div>`;
-  document.body.appendChild(hoja);
-  hoja.addEventListener('click', e => { if (e.target.closest('[data-cerrar]') || e.target === hoja) hoja.remove(); });
 }
 
 function marcarBotonesListos() {
-  const wa = app.querySelector('[data-accion="enviar-whatsapp"]');
-  if (wa) {
-    const et = wa.querySelector('span:last-child');
-    if (et) et.textContent = archivosListos.enlaces ? 'WhatsApp' : (archivosListos.subiendo || !archivosListos.pdf ? 'Preparando…' : 'WhatsApp');
-    wa.classList.toggle('apagado', !archivosListos.enlaces);
-  }
   for (const tipo of ['pdf', 'word']) {
     const abrir = app.querySelector(`[data-accion="abrir-${tipo}"]`);
     if (abrir) abrir.disabled = !archivosListos[tipo];
@@ -1155,7 +1066,6 @@ function ocultarDeshacer() {
 }
 
 const ICONO_OJO_TACHADO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 3l18 18"/><path d="M10.6 5.1A10 10 0 0 1 12 5c5 0 9 4.5 10 7-.4 1-1.2 2.3-2.4 3.5M6.6 6.6C4.3 8 2.7 10.2 2 12c1 2.5 5 7 10 7 1.9 0 3.6-.6 5.1-1.5"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/></svg>';
-const ICONO_WA = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2a10 10 0 0 0-8.6 15.1L2 22l5-1.3A10 10 0 1 0 12 2zm0 18.2c-1.5 0-3-.4-4.3-1.2l-.3-.2-3 .8.8-2.9-.2-.3A8.2 8.2 0 1 1 12 20.2zm4.5-6.1c-.2-.1-1.5-.7-1.7-.8-.2-.1-.4-.1-.6.1l-.8 1c-.1.2-.3.2-.5.1a6.7 6.7 0 0 1-3.3-2.9c-.3-.4.2-.4.6-1.3.1-.2 0-.3 0-.4l-.8-1.8c-.2-.5-.4-.4-.6-.4h-.5c-.2 0-.4.1-.6.3-.2.2-.8.8-.8 2s.8 2.3.9 2.5c.1.2 1.6 2.5 4 3.5 1.5.6 2.1.7 2.8.6.5-.1 1.5-.6 1.7-1.2.2-.6.2-1.1.2-1.2-.1-.1-.2-.2-.4-.3z"/></svg>';
 const ICONO_OJO = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12c1-2.5 5-7 10-7s9 4.5 10 7c-1 2.5-5 7-10 7S3 14.5 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
 
 function botonOcultar(h, chico = false) {
@@ -1626,7 +1536,6 @@ app.addEventListener('click', async e => {
       break;
     }
     case 'compartir-word': compartirArchivo('word', id); break;
-    case 'enviar-whatsapp': enviarPorWhatsApp(id); break;
     case 'abrir-pdf': case 'abrir-word': {
       const tipo = a === 'abrir-pdf' ? 'pdf' : 'word';
       const archivo = archivosListos.visitaId === id ? archivosListos[tipo] : null;
